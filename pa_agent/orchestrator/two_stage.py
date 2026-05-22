@@ -648,7 +648,12 @@ class TwoStageOrchestrator:
         print(f"\n--- [Token 用量] prompt={reply_s2.usage.prompt_tokens} completion={reply_s2.usage.completion_tokens} latency={reply_s2.latency_ms:.0f}ms ---")
         print("="*80 + "\n")
 
-        result_s2 = self._validator.validate("stage2", reply_s2.content)
+        result_s2 = self._validator.validate(
+            "stage2",
+            reply_s2.content,
+            decision_stance=record.meta.decision_stance,
+            kline_frame=frame,
+        )
 
         if isinstance(result_s2, ValidationError):
             err = result_s2

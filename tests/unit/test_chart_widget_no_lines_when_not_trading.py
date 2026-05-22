@@ -141,3 +141,16 @@ class TestNoLinesWhenNotTrading:
             "Expected no InfiniteLine items after reset(), "
             f"but found {_count_infinite_lines(chart_widget)}."
         )
+
+    def test_clear_decision_overlay_keeps_lines_gone(self, chart_widget):
+        """clear_decision_overlay() removes trade lines without requiring reset()."""
+        chart_widget.set_decision({
+            "order_type": "限价单",
+            "order_direction": "做多",
+            "entry_price": 1900.0,
+            "take_profit_price": 1920.0,
+            "stop_loss_price": 1880.0,
+        })
+        chart_widget.clear_decision_overlay()
+        assert _count_infinite_lines(chart_widget) == 0
+        assert chart_widget._pending_decision is None

@@ -745,7 +745,14 @@ class MainWindow(QMainWindow):
             return None
         if ts is None or not tf:
             return None
-        return seconds_until_bar_closes(int(ts), tf, now_ms=now_local_ms())
+        now_ms: int | None = None
+        data_source = getattr(self._ctx, "data_source", None)
+        server_time_ms = getattr(data_source, "server_time_ms", None)
+        if callable(server_time_ms):
+            now_ms = server_time_ms()
+        if now_ms is None:
+            now_ms = now_local_ms()
+        return seconds_until_bar_closes(int(ts), tf, now_ms=now_ms)
 
     def _update_wait_close_countdown_display(self) -> None:
         """Update checkbox-adjacent countdown and status bar while waiting."""
@@ -791,8 +798,17 @@ class MainWindow(QMainWindow):
         symbol = self._pending_submit_symbol
         timeframe = self._pending_submit_timeframe
         bar_count = self._pending_submit_bar_count
+        force_incremental = self._pending_force_incremental
+        leaving_demo = self._demo_mode
+        if leaving_demo:
+            self._exit_demo_mode(silent=True)
         self._clear_pending_bar_close_wait()
-        if self._pending_force_incremental:
+        submit_hint = "提交增量分析" if force_incremental else "提交分析"
+        if leaving_demo:
+            self._status_bar.showMessage(
+                f"最新K线已收盘，已退出演示模式，正在{submit_hint}…"
+            )
+        elif force_incremental:
             self._status_bar.showMessage("最新K线已收盘，正在提交增量分析…")
         else:
             self._status_bar.showMessage("最新K线已收盘，正在提交分析…")
@@ -800,7 +816,7 @@ class MainWindow(QMainWindow):
             symbol,
             timeframe,
             bar_count,
-            force_incremental=self._pending_force_incremental,
+            force_incremental=force_incremental,
             snapshot_bars=bars,
         )
 
@@ -878,12 +894,19 @@ class MainWindow(QMainWindow):
 
     def _start_demo_mode(self, mode: str) -> None:
         """Load a pending JSON record and replay it through the UI."""
+        from pathlib import Path
+
         from pa_agent.config.paths import RECORDS_PENDING_DIR
-        from pa_agent.demo.record_loader import load_analysis_record, pick_random_record_path
+        from pa_agent.demo.record_loader import (
+            is_demo_playable,
+            pick_playable_demo_record,
+            try_load_analysis_record,
+        )
 
         self._demo_mode_kind = str(mode)
         self._demo_auto_next_armed = False
 
+        skipped_note = ""
         if mode == "manual":
             start_dir = str(RECORDS_PENDING_DIR)
             path_str, _ = QFileDialog.getOpenFileName(
@@ -894,85 +917,49 @@ class MainWindow(QMainWindow):
             )
             if not path_str:
                 return
-            from pathlib import Path
-
             path = Path(path_str)
+            record = try_load_analysis_record(path)
+            if record is None or not is_demo_playable(record):
+                alt = pick_playable_demo_record(exclude=path)
+                if alt is None:
+                    QMessageBox.warning(
+                        self,
+                        "演示模式",
+                        "所选记录无法读取或缺少阶段结果，且目录中没有其它可用记录。",
+                    )
+                    return
+                skipped_note = path.name
+                path, record = alt
         else:
-            path = pick_random_record_path()
-            if path is None:
+            path, record = self._try_load_random_demo_record()
+            if record is None:
                 QMessageBox.warning(
                     self,
                     "演示模式",
-                    f"未找到可用记录：\n{RECORDS_PENDING_DIR}",
+                    f"未找到可读取的演示记录（已跳过损坏或不完整的文件）：\n{RECORDS_PENDING_DIR}",
                 )
                 return
 
-        try:
-            record = load_analysis_record(path)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "演示模式", f"无法读取记录：\n{exc}")
-            return
-
-        if not record.stage2_decision and not record.stage1_diagnosis:
-            QMessageBox.warning(
+        if skipped_note:
+            QMessageBox.information(
                 self,
                 "演示模式",
-                "该记录缺少阶段一/阶段二结果，无法完整演示。",
+                f"已跳过无法使用的记录「{skipped_note}」，\n"
+                f"改用：{path.name}",
             )
-            return
 
         self._enter_demo_mode(path, record)
 
     def _try_load_random_demo_record(self) -> tuple[Any, Any] | tuple[None, None]:
-        """Return (path, record) for a random pending record, or (None, None)."""
-        from pa_agent.demo.record_loader import load_analysis_record, list_pending_record_paths
+        """Return (path, record) for a random playable pending record, or (None, None)."""
+        from pa_agent.demo.record_loader import pick_playable_demo_record
 
-        paths = list_pending_record_paths()
-        if not paths:
-            return None, None
-
-        def _has_flow_viz_payload(rec: Any) -> bool:
-            s2 = getattr(rec, "stage2_decision", None)
-            if not isinstance(s2, dict):
-                return False
-            return bool(s2.get("decision_trace") or s2.get("terminal"))
-
-        # Try a few times to avoid repeating the same record when possible.
-        last = self._demo_record_path or ""
-        # Pass 1: prefer records that can render decision-flow visualization
-        for _ in range(10):
-            import random
-
-            path = random.choice(paths)
-            if len(paths) > 1 and str(path) == last:
-                continue
-            try:
-                record = load_analysis_record(path)
-            except Exception:  # noqa: BLE001
-                continue
-            if _has_flow_viz_payload(record):
-                return path, record
-        # Pass 2 fallback: any record with stage1/stage2 payload (may not have flow viz)
-        for _ in range(10):
-            import random
-
-            path = random.choice(paths)
-            if len(paths) > 1 and str(path) == last:
-                continue
-            try:
-                record = load_analysis_record(path)
-            except Exception:  # noqa: BLE001
-                continue
-            if getattr(record, "stage2_decision", None) or getattr(record, "stage1_diagnosis", None):
-                return path, record
-        # Fallback: just take the newest valid one
-        for path in paths:
-            try:
-                record = load_analysis_record(path)
-            except Exception:  # noqa: BLE001
-                continue
-            if _has_flow_viz_payload(record) or getattr(record, "stage2_decision", None) or getattr(record, "stage1_diagnosis", None):
-                return path, record
+        last = self._demo_record_path or None
+        picked = pick_playable_demo_record(exclude=last)
+        if picked is not None:
+            return picked
+        if last:
+            return pick_playable_demo_record(exclude=None) or (None, None)
         return None, None
 
     def _schedule_next_auto_demo(self, *, delay_ms: int = 650) -> None:
@@ -998,7 +985,13 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(max(60, int(delay_ms)), _go)
 
-    def _enter_demo_mode(self, path: Any, record: Any) -> None:
+    def _enter_demo_mode(
+        self,
+        path: Any,
+        record: Any,
+        *,
+        _skip_retry: int = 0,
+    ) -> None:
         """Switch UI into demo state and start timed replay."""
         from pathlib import Path
 
@@ -1033,10 +1026,22 @@ class MainWindow(QMainWindow):
                 snapshot_ts_local_ms=meta.timestamp_local_ms,
             )
         except Exception as exc:  # noqa: BLE001
-            self._exit_demo_mode()
-            QMessageBox.critical(self, "演示模式", f"无法构建 K 线快照：\n{exc}")
+            self._exit_demo_mode(silent=True)
+            if _skip_retry < 8:
+                alt = self._try_load_random_demo_record()
+                if alt[0] is not None and str(alt[0]) != str(path):
+                    self._demo_mode_kind = prev_kind
+                    self._enter_demo_mode(alt[0], alt[1], _skip_retry=_skip_retry + 1)
+                    return
+            QMessageBox.warning(
+                self,
+                "演示模式",
+                f"无法构建 K 线快照，已跳过该记录：\n{Path(path).name}\n{exc}",
+            )
             return
 
+        # New record may use a different symbol/TF; drop previous trade overlays first.
+        self._chart_widget.reset()
         self._chart_widget.set_frame(frame)
         self._set_chart_refresh_paused(True)
         self._analysis_in_progress = True
@@ -1145,6 +1150,8 @@ class MainWindow(QMainWindow):
         self._decision_badge.setText("")
 
         if was_demo and not silent:
+            if hasattr(self, "_chart_widget"):
+                self._chart_widget.reset()
             self._status_bar.showMessage("已退出演示模式")
             self._refresh_chart_once()
 
@@ -1420,10 +1427,14 @@ class MainWindow(QMainWindow):
         if decision:
             inner = decision.get("decision", decision)
             self._chart_widget.set_decision(inner)
+            stance = None
+            if self._ctx.settings is not None:
+                stance = getattr(self._ctx.settings.general, "decision_stance", None)
             self._decision_panel.set_decision(
                 inner,
                 diagnosis_summary=decision.get("diagnosis_summary"),
                 stage1_diagnosis=self._last_stage1_diagnosis,
+                decision_stance=stance,
             )
             self._bind_decision_tree(decision, self._last_stage1_diagnosis)
             order = inner.get("order_type", "—")
@@ -1431,6 +1442,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "_demo_mode", False):
                 self._present_decision_flow_playback(force_play=True)
         else:
+            self._chart_widget.clear_decision_overlay()
             self._decision_panel.clear()
             self._decision_tree_panel.clear()
             if getattr(self, "_decision_flow_viz_panel", None) is not None:
@@ -1560,10 +1572,13 @@ class MainWindow(QMainWindow):
         s2_full = getattr(record, "stage2_decision", None)
         if s2_full:
             inner = s2_full.get("decision", s2_full)
+            meta = getattr(record, "meta", None)
+            stance = getattr(meta, "decision_stance", None) if meta is not None else None
             self._decision_panel.set_decision(
                 inner,
                 diagnosis_summary=s2_full.get("diagnosis_summary"),
                 stage1_diagnosis=s1_diag if isinstance(s1_diag, dict) else None,
+                decision_stance=stance,
             )
             self._bind_decision_tree(
                 s2_full,

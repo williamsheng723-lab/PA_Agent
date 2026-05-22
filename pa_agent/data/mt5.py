@@ -153,6 +153,33 @@ class MT5Source(DataSource):
         self._timeframe = ""
         logger.info("MT5Source unsubscribed")
 
+    def server_time_ms(self, symbol: str | None = None) -> int | None:
+        """Broker/server time from the latest MT5 tick (milliseconds since epoch).
+
+        Use this for forming-bar countdowns so ``now`` matches ``rate['time']``
+        on K-line bars. Falls back to None when disconnected or tick unavailable.
+        """
+        if not self._connected:
+            return None
+        name = (symbol or self._symbol or "").strip()
+        if not name:
+            return None
+        try:
+            import MetaTrader5 as mt5  # type: ignore[import]
+
+            tick = mt5.symbol_info_tick(name)
+            if tick is None:
+                return None
+            time_msc = getattr(tick, "time_msc", None)
+            if time_msc:
+                return int(time_msc)
+            tick_time = getattr(tick, "time", None)
+            if tick_time:
+                return int(tick_time) * 1000
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MT5 server_time_ms(%s) failed: %s", name, exc)
+        return None
+
     # ── Data fetch ────────────────────────────────────────────────────────────
 
     def latest_snapshot(self, n: int) -> list[KlineBar]:

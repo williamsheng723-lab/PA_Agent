@@ -151,6 +151,77 @@ def _repair_unescaped_quotes(text: str) -> str:
     return "".join(out)
 
 
+# ── Truncated JSON repair ───────────────────────────────────────────────────────
+
+def _balance_json_brackets(text: str) -> str:
+    """Close unclosed ``{`` / ``[`` outside JSON strings."""
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            stack.append("{")
+        elif ch == "[":
+            stack.append("[")
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+    closers = "".join("]" if opener == "[" else "}" for opener in reversed(stack))
+    return text + closers
+
+
+def _inject_stage1_missing_tail(text: str) -> str:
+    """Append minimal gate fields when the model stopped after bar_by_bar_summary."""
+    lowered = text.lower()
+    if '"gate_result"' in lowered or '"gate_trace"' in lowered:
+        return text
+
+    tail = text.rstrip()
+    if not tail.endswith((",", "]", "}")):
+        return text
+
+    if not tail.endswith(","):
+        tail += ","
+
+    stub_trace = (
+        '{"node_id":"AUTO","question":"输出是否在gate_trace前被截断？",'
+        '"answer":"否","reason":"JSON在gate_trace前截断，程序已补全最小闸门记录",'
+        '"bar_range":"K1"}'
+    )
+    tail += f'"gate_trace":[{stub_trace}],"gate_result":"unknown"'
+    return _balance_json_brackets(tail)
+
+
+def _try_repair_json_syntax(text: str, stage: Literal["stage1", "stage2"]) -> str | None:
+    """Return repaired JSON text when truncation caused a syntax error, else None."""
+    if not text.strip().startswith("{"):
+        return None
+
+    candidate = text.rstrip()
+    if stage == "stage1":
+        candidate = _inject_stage1_missing_tail(candidate)
+    candidate = _balance_json_brackets(candidate)
+    if candidate == text.rstrip():
+        return None
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return candidate
+
+
 # ── JsonValidator ─────────────────────────────────────────────────────────────
 
 class JsonValidator:
@@ -163,7 +234,14 @@ class JsonValidator:
             "stage2": STAGE2_SCHEMA,
         }
 
-    def validate(self, stage: Literal["stage1", "stage2"], raw_text: str) -> Result:
+    def validate(
+        self,
+        stage: Literal["stage1", "stage2"],
+        raw_text: str,
+        *,
+        decision_stance: str | None = None,
+        kline_frame: Any = None,
+    ) -> Result:
         """Validate *raw_text* against the schema for *stage*.
 
         Returns Ok(obj) on success, ValidationError on any failure.
@@ -184,14 +262,27 @@ class JsonValidator:
         try:
             obj = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            pos = f"{exc.lineno}:{exc.colno}"
-            return ValidationError(
-                category="a",
-                stage=stage,
-                raw_text=raw_text,
-                parse_position=pos,
-                message=f"JSON syntax error at {pos}: {exc.msg}",
-            )
+            repaired = _try_repair_json_syntax(stripped, stage)
+            if repaired is not None:
+                try:
+                    obj = json.loads(repaired)
+                    logger.warning(
+                        "Repaired truncated %s JSON (%d -> %d chars)",
+                        stage,
+                        len(stripped),
+                        len(repaired),
+                    )
+                except json.JSONDecodeError:
+                    repaired = None
+            if repaired is None:
+                pos = f"{exc.lineno}:{exc.colno}"
+                return ValidationError(
+                    category="a",
+                    stage=stage,
+                    raw_text=raw_text,
+                    parse_position=pos,
+                    message=f"JSON syntax error at {pos}: {exc.msg}",
+                )
 
         if not isinstance(obj, dict):
             return ValidationError(
@@ -218,8 +309,6 @@ class JsonValidator:
             return Ok(obj=obj)
 
         errors = list(jsonschema.Draft7Validator(schema).iter_errors(obj))
-        if not errors:
-            return Ok(obj=obj)
 
         # Classify errors
         missing: list[str] = []
@@ -236,7 +325,7 @@ class JsonValidator:
                 if "enum" in err.schema:
                     allowed[str(path)] = err.schema["enum"]
 
-        # ── Explicit 不下单 ↔ null iron law check ─────────────────────────────
+        # ── Explicit cross-field checks ───────────────────────────────────────
         if stage == "stage1":
             from pa_agent.ai.decision_tree import validate_gate_result_consistency
 
@@ -249,10 +338,27 @@ class JsonValidator:
                 invalid.extend(no_order_err["fields"])
                 allowed.update(no_order_err["allowed"])
 
+            breakout_err = self._check_breakout_order_basis(obj)
+            if breakout_err:
+                invalid.extend(breakout_err["fields"])
+                allowed.update(breakout_err["allowed"])
+
+            for msg in self._check_breakout_price_extreme(obj, kline_frame):
+                invalid.append(f"breakout_price:{msg}")
+
+            for msg in self._check_signal_chain(obj, kline_frame):
+                invalid.append(f"signal_chain:{msg}")
+
+            for msg in self._check_trade_metrics(obj, decision_stance=decision_stance):
+                invalid.append(f"metrics:{msg}")
+
             from pa_agent.ai.decision_tree import validate_stage2_trace_consistency
 
             for msg in validate_stage2_trace_consistency(obj):
                 invalid.append(f"trace:{msg}")
+
+        if not errors and not missing and not invalid:
+            return Ok(obj=obj)
 
         # Determine category: b if only missing fields, c otherwise
         if invalid or (missing and errors[0].validator not in ("required",)):
@@ -262,6 +368,7 @@ class JsonValidator:
         else:
             category = "c"
 
+        first_message = errors[0].message[:120] if errors else (invalid[0] if invalid else "custom validation failed")
         return ValidationError(
             category=category,
             stage=stage,
@@ -269,7 +376,7 @@ class JsonValidator:
             missing_fields=missing,
             invalid_fields=invalid,
             allowed_values=allowed,
-            message=f"{len(errors)} schema error(s): {errors[0].message[:120]}",
+            message=f"{len(errors)} schema error(s): {first_message}",
         )
 
     @staticmethod
@@ -305,3 +412,182 @@ class JsonValidator:
                     },
                 }
         return None
+
+    @staticmethod
+    def _check_breakout_order_basis(obj: dict) -> dict | None:
+        """Require breakout orders to be tied to a bar extreme, not a mid-bar price."""
+        decision = obj.get("decision", {})
+        if not isinstance(decision, dict) or decision.get("order_type") != "突破单":
+            return None
+
+        fields: list[str] = []
+        allowed: dict[str, list] = {}
+        direction = decision.get("order_direction")
+        extreme = decision.get("entry_basis_extreme")
+
+        if not decision.get("entry_basis_bar"):
+            fields.append("decision.entry_basis_bar")
+            allowed["decision.entry_basis_bar"] = ["K{n}"]
+        if extreme not in ("high", "low"):
+            fields.append("decision.entry_basis_extreme")
+            allowed["decision.entry_basis_extreme"] = ["high", "low"]
+        if not decision.get("entry_rule"):
+            fields.append("decision.entry_rule")
+            allowed["decision.entry_rule"] = [
+                "做多突破单=依据K线高点上方1跳动",
+                "做空突破单=依据K线低点下方1跳动",
+            ]
+
+        if direction == "做多" and extreme == "low":
+            fields.append("decision.entry_basis_extreme")
+            allowed["decision.entry_basis_extreme"] = ["做多突破单必须使用 high"]
+        if direction == "做空" and extreme == "high":
+            fields.append("decision.entry_basis_extreme")
+            allowed["decision.entry_basis_extreme"] = ["做空突破单必须使用 low"]
+
+        if fields:
+            return {"fields": fields, "allowed": allowed}
+        return None
+
+    @staticmethod
+    def _check_trade_metrics(
+        obj: dict,
+        *,
+        decision_stance: str | None = None,
+    ) -> list[str]:
+        """Enforce RR and trader equation from entry/stop/target (not narrative distances)."""
+        from pa_agent.util.trade_metrics import validate_order_trade_metrics
+
+        decision = obj.get("decision", {})
+        if not isinstance(decision, dict):
+            return []
+        return validate_order_trade_metrics(
+            decision,
+            decision_stance=decision_stance,
+        )
+
+    @staticmethod
+    def _check_breakout_price_extreme(obj: dict, kline_frame: Any = None) -> list[str]:
+        """Numerically verify breakout entry is outside the cited bar extreme."""
+        if kline_frame is None:
+            return []
+        decision = obj.get("decision", {})
+        if not isinstance(decision, dict) or decision.get("order_type") != "突破单":
+            return []
+
+        basis = _parse_k_seq(decision.get("entry_basis_bar"))
+        if basis is None:
+            return []
+        bar = _bar_by_seq(kline_frame, basis)
+        if bar is None:
+            return [f"entry_basis_bar K{basis} not found in current K-line frame"]
+
+        try:
+            entry = float(decision.get("entry_price"))
+        except (TypeError, ValueError):
+            return []
+
+        direction = decision.get("order_direction")
+        extreme = decision.get("entry_basis_extreme")
+        if direction == "做多" and extreme == "high" and entry <= float(bar.high):
+            return (
+                f"做多突破单 entry_price={entry:.6g} must be above "
+                f"K{basis}.high={float(bar.high):.6g}"
+            )
+        if direction == "做空" and extreme == "low" and entry >= float(bar.low):
+            return (
+                f"做空突破单 entry_price={entry:.6g} must be below "
+                f"K{basis}.low={float(bar.low):.6g}"
+            )
+        return []
+
+    @staticmethod
+    def _check_signal_chain(obj: dict, kline_frame: Any = None) -> list[str]:
+        """Require order decisions to ground §9 in signal/entry/follow-through facts."""
+        decision = obj.get("decision", {})
+        if not isinstance(decision, dict):
+            return []
+        if decision.get("order_type") not in ("限价单", "突破单", "市价单"):
+            return []
+
+        errors: list[str] = []
+        bar_analysis = obj.get("bar_analysis")
+        if not isinstance(bar_analysis, dict):
+            return ["bar_analysis is required when placing an order"]
+
+        signal_bar = bar_analysis.get("signal_bar")
+        entry_bar = bar_analysis.get("entry_bar")
+        if not isinstance(signal_bar, dict):
+            errors.append("bar_analysis.signal_bar is required when placing an order")
+        if not isinstance(entry_bar, dict):
+            errors.append("bar_analysis.entry_bar is required when placing an order")
+        if errors:
+            return errors
+
+        sig_seq = _parse_k_seq(signal_bar.get("bar"))
+        entry_seq = _parse_k_seq(entry_bar.get("bar"))
+        if sig_seq is None:
+            errors.append("bar_analysis.signal_bar.bar must be a K{n} reference")
+        if entry_seq is None:
+            errors.append("bar_analysis.entry_bar.bar must be a K{n} reference")
+        if sig_seq is not None and entry_seq is not None and sig_seq <= entry_seq:
+            errors.append(
+                "signal_bar must be older than entry_bar "
+                f"(expected signal K seq > entry K seq, got K{sig_seq} and K{entry_seq})"
+            )
+        if kline_frame is not None:
+            for label, seq in (("signal_bar", sig_seq), ("entry_bar", entry_seq)):
+                if seq is not None and _bar_by_seq(kline_frame, seq) is None:
+                    errors.append(f"bar_analysis.{label}.bar K{seq} not found in current K-line frame")
+
+        quality = str(signal_bar.get("quality", "")).strip().lower()
+        if quality in ("weak", "invalid"):
+            reasons = _all_stage2_reasons(obj)
+            if not any(token in reasons for token in ("弱", "瑕疵", "激进", "仍可", "例外")):
+                errors.append(
+                    "weak/invalid signal_bar requires explicit §9 reasoning for why the setup remains tradable"
+                )
+
+        follow = entry_bar.get("follow_through")
+        no_follow = follow is False or str(follow).strip().lower() in ("false", "no", "failed")
+        freshness = str(entry_bar.get("freshness", "fresh")).strip().lower()
+        trade_conf = decision.get("trade_confidence")
+        try:
+            trade_conf_num = int(trade_conf)
+        except (TypeError, ValueError):
+            trade_conf_num = 0
+        if freshness in ("stale", "invalid"):
+            errors.append("entry_bar.freshness stale/invalid cannot support a new order")
+        if no_follow and trade_conf_num >= 50:
+            errors.append(
+                "entry_bar.follow_through=false/failed cannot support trade_confidence >= 50"
+            )
+        return errors
+
+
+def _parse_k_seq(value: object) -> int | None:
+    if value is None:
+        return None
+    m = re.search(r"K\s*(\d+)", str(value), flags=re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _bar_by_seq(kline_frame: Any, seq: int) -> Any | None:
+    for bar in getattr(kline_frame, "bars", ()) or ():
+        if getattr(bar, "seq", None) == seq:
+            return bar
+    return None
+
+
+def _all_stage2_reasons(obj: dict) -> str:
+    parts: list[str] = []
+    decision = obj.get("decision", {})
+    if isinstance(decision, dict):
+        for key in ("reasoning", "trade_confidence_reasoning", "risk_assessment"):
+            parts.append(str(decision.get(key, "") or ""))
+    for item in obj.get("decision_trace", []) or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("reason", "") or ""))
+    return "\n".join(parts)

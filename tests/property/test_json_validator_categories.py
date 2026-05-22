@@ -21,6 +21,17 @@ def _valid_stage1() -> dict:
         "entry_setup": "pullback to EMA20",
         "strategy_files_needed": ["上涨通道分析识别.txt"],
         "risk_warning": "watch for reversal",
+        "bar_by_bar_summary": [
+            {
+                "bar": "K1",
+                "role": "structure",
+                "bar_type": "trend_bull",
+                "context_effect": "strengthens_bull",
+                "follow_through": "pending",
+                "trapped_side": "none",
+                "reason": "最新K线支持多头结构",
+            }
+        ],
         "gate_trace": [
             {
                 "node_id": "0.1",
@@ -197,6 +208,18 @@ def test_markdown_fenced_json_is_accepted():
     raw = f"```json\n{json.dumps(_valid_stage1())}\n```"
     result = validator.validate("stage1", raw)
     assert isinstance(result, Ok)
+
+
+def test_truncated_stage1_after_bar_by_bar_summary_is_repaired():
+    """JSON cut off after bar_by_bar_summary is closed and gate fields injected."""
+    obj = _valid_stage1()
+    del obj["gate_trace"]
+    del obj["gate_result"]
+    truncated = json.dumps(obj, ensure_ascii=False)[:-1] + ","
+    result = validator.validate("stage1", truncated)
+    assert isinstance(result, Ok), result
+    assert result.obj["gate_result"] == "unknown"
+    assert len(result.obj["gate_trace"]) >= 1
 
 
 def test_stage2_json_with_trailing_fence_only_is_accepted():

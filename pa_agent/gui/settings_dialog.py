@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -208,12 +209,40 @@ class SettingsDialog(QDialog):
             int(getattr(g, "decision_flow_default_zoom_pct", 500))
         )
 
+    @staticmethod
+    def _validate_provider_fields(model: str, base_url: str) -> str | None:
+        """Return user-facing error text, or None if fields look consistent."""
+        if model.startswith(("http://", "https://")) and not base_url.startswith(
+            ("http://", "https://")
+        ):
+            return (
+                "「模型」与「Base URL」似乎填反了：\n"
+                "• 模型应填模型名，如 deepseek-v4-pro 或 claude-sonnet-4-6\n"
+                "• Base URL 应填接口地址，如 https://api.deepseek.com"
+            )
+        if base_url.startswith(("http://", "https://")):
+            return None
+        if not base_url:
+            return "请填写 Base URL（API 接口地址）。"
+        return (
+            f"Base URL 不是有效网址（当前：{base_url}）。\n"
+            "DeepSeek 示例：https://api.deepseek.com\n"
+            "PackyAPI 示例：https://www.packyapi.com/v1"
+        )
+
     def _on_save(self) -> None:
         p = self._settings.provider
         g = self._settings.general
 
-        p.model = self._model_edit.text().strip()
-        p.base_url = self._base_url_edit.text().strip()
+        model = self._model_edit.text().strip()
+        base_url = self._base_url_edit.text().strip()
+        field_err = self._validate_provider_fields(model, base_url)
+        if field_err:
+            QMessageBox.warning(self, "AI 提供商配置有误", field_err)
+            return
+
+        p.model = model
+        p.base_url = base_url
         p.api_key = self._api_key_edit.text()
         p.thinking = self._thinking_check.isChecked()
         p.reasoning_effort = self._reasoning_effort_combo.currentText()  # type: ignore[assignment]

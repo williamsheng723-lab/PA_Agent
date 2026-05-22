@@ -46,7 +46,13 @@ def assembler(tmp_path: Path) -> PromptAssembler:
         "市场诊断框架.txt",
         "二元决策.txt",
         "文件16-K线信号识别.txt",
+        "逐棒分析检查单.txt",
         "文件17-止损和止盈与仓位管理.txt",
+        "文件18-突破失败与突破测试.txt",
+        "文件19-H1H2-L1L2计数.txt",
+        "文件20-AlwaysIn与20GB.txt",
+        "文件21-铁丝网与无交易环境.txt",
+        "文件22-信号失败后的磁力位.txt",
         "上涨通道分析识别.txt",
         "上涨通道交易策略.txt",
         "文件13-窄通道与宽通道策略.txt",
@@ -56,21 +62,26 @@ def assembler(tmp_path: Path) -> PromptAssembler:
 
 
 def test_stage1_system_prompt_order(assembler: PromptAssembler):
-    """Stage 1 system prompt is stable; task files live in the user turn."""
+    """Stage 1 system: shared persona + binary tree; user: framework + signals."""
     frame = _make_frame()
     messages = assembler.build_stage1(frame)
     system = messages[0]["content"]
     user = messages[1]["content"]
     pos_persona = system.find("提示词大纲_人设与思维方式")
+    pos_binary_sys = system.find("二元决策")
     assert pos_persona >= 0
+    assert 0 <= pos_persona < pos_binary_sys, "Binary tree should follow persona in system"
     assert "市场诊断框架" not in system
 
     pos_diag = user.find("市场诊断框架")
-    pos_binary = user.find("二元决策")
     pos_signal = user.find("文件16-K线信号识别")
-    assert 0 <= pos_diag < pos_binary < pos_signal, (
-        "Stage 1 prompt files are out of order"
+    pos_bar_by_bar = user.find("逐棒分析检查单")
+    assert "[CONTENT OF 二元决策.txt]" not in user, (
+        "Full binary tree file is only in system (shared with stage 2)"
     )
+    assert "[CONTENT OF 二元决策.txt]" in system
+    assert 0 <= pos_diag < pos_signal, "Stage 1 user task files are out of order"
+    assert 0 <= pos_signal < pos_bar_by_bar, "Bar-by-bar checklist should follow signal file"
 
 
 def test_stage1_user_prompt_contains_required_fields(assembler: PromptAssembler):
@@ -81,6 +92,8 @@ def test_stage1_user_prompt_contains_required_fields(assembler: PromptAssembler)
     assert "XAUUSD" in user
     assert "1h" in user
     assert "序号" in user
+    assert "K线几何特征" in user
+    assert "doji" in user
     assert "更高时间框架" not in user
 
 
@@ -99,7 +112,7 @@ def test_stage2_user_prompt_includes_gate_trace(assembler: PromptAssembler):
 
 
 def test_stage2_system_prompt_order(assembler: PromptAssembler):
-    """Stage 2 user turn: 二元决策 → 策略 → 风控 → 契约."""
+    """Stage 2 system reuses stage-1 system (persona + binary); user: strategy → risk."""
     frame = _make_frame()
     stage1_json = {"cycle_position": "normal_channel", "direction": "bullish"}
     strategy_files = ["上涨通道分析识别.txt", "上涨通道交易策略.txt", "文件13-窄通道与宽通道策略.txt"]
@@ -108,15 +121,20 @@ def test_stage2_system_prompt_order(assembler: PromptAssembler):
     user = messages[1]["content"]
 
     pos_persona = system.find("提示词大纲_人设与思维方式")
+    pos_binary_sys = system.find("二元决策")
     assert pos_persona >= 0
-    assert "二元决策" not in system
+    assert 0 <= pos_persona < pos_binary_sys
 
-    pos_binary = user.find("二元决策")
-    pos_strategy = user.find("上涨通道分析识别")
-    pos_risk = user.find("文件17-止损和止盈与仓位管理")
-    assert 0 <= pos_binary < pos_strategy < pos_risk, (
-        "Stage 2 prompt files are out of order"
+    assert "[CONTENT OF 二元决策.txt]" not in user, (
+        "Full binary tree file is not duplicated in stage 2 user turn"
     )
+    assert "[CONTENT OF 二元决策.txt]" in system
+    pos_strategy = user.find("上涨通道分析识别")
+    pos_bar_by_bar = user.find("逐棒分析检查单")
+    pos_signal = user.find("文件16-K线信号识别")
+    pos_risk = user.find("文件17-止损和止盈与仓位管理")
+    assert 0 <= pos_strategy < pos_risk, "Stage 2 user task files are out of order"
+    assert 0 <= pos_bar_by_bar < pos_signal < pos_risk
 
 
 def test_stage2_user_prompt_contains_stage1_json(assembler: PromptAssembler):
@@ -136,6 +154,8 @@ def test_stage1_output_reminder_present(assembler: PromptAssembler):
     user = messages[1]["content"]
     assert "cycle_position" in user
     assert "diagnosis_confidence" in user
+    assert "bar_by_bar_summary" in user
+    assert "逐K摘要硬规则" in user
     assert "gate_trace" in user
     assert "gate_result" in user
 
@@ -147,6 +167,12 @@ def test_stage2_output_contract_present(assembler: PromptAssembler):
     user = messages[1]["content"]
     assert "不下单" in user
     assert "order_direction" in user
+    assert "bar_analysis" in user
+    assert "entry_basis_bar" in user
+    assert "突破单 entry_price 硬规则" in user
+    assert "§9 逐K信号链与新鲜度硬规则" in user
+    assert "K线几何特征" in user
+    assert "EMA缺口数" in user
     assert "decision_trace" in user
     assert "terminal" in user
 
@@ -289,3 +315,4 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     assert "上一轮已完成分析" in user
     assert "normal_channel" in user
     assert "当前完整 K线数据" in user
+    assert "当前完整 K线几何特征" in user

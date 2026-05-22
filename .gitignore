@@ -11,13 +11,29 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
 
-# runtime artifacts
-logs/*.log
+# ── Local secrets & settings (never commit) ───────────────────────────────────
+.env
+.env.*
 config/settings.json
+config/settings.local.json
 config/exception_state.json
-records/pending/*.json
-records/pending/*.jsonl
-
-# secrets
 config/secret.key
+*.pem
+*.key
+
+# ── Runtime artifacts ─────────────────────────────────────────────────────────
+logs/*
+!logs/.gitkeep
+
+records/**/*
+!records/**/.gitkeep
+
+experience/**/*
+!experience/**/.gitkeep
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store

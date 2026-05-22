@@ -7,6 +7,8 @@ from typing import Any
 from pa_agent.util.trade_metrics import (
     compute_risk_reward,
     format_estimated_win_rate,
+    min_risk_reward_ratio,
+    passes_trader_equation,
 )
 
 from PyQt6.QtWidgets import (
@@ -405,6 +407,7 @@ class DecisionPanel(QWidget):
         *,
         diagnosis_summary: dict | None = None,
         stage1_diagnosis: dict | None = None,
+        decision_stance: str | None = None,
     ) -> None:
         self._apply_market_diagnosis(diagnosis_summary, stage1_diagnosis)
 
@@ -438,10 +441,32 @@ class DecisionPanel(QWidget):
 
             rr = compute_risk_reward(entry, tp, sl, direction)
             if rr is not None:
-                self._rr_inline_label.setText(f"盈亏比  {rr['ratio_text']}")
+                ratio = float(rr["ratio"])
+                risk = float(rr["risk"])
+                reward = float(rr["reward"])
+                win_pct = _parse_score_100(decision.get("estimated_win_rate"))
+                eq_ok = (
+                    win_pct is not None
+                    and passes_trader_equation(win_pct, risk, reward)
+                )
+                min_rr = min_risk_reward_ratio(decision_stance)
+                metrics_ok = ratio >= min_rr and (eq_ok if win_pct is not None else True)
+                eq_note = ""
+                if win_pct is not None:
+                    eq_note = " · 方程通过" if eq_ok else " · 方程不通过"
+                self._rr_inline_label.setText(
+                    f"盈亏比  {rr['ratio_text']}（风险 {risk:.4g} / 回报 {reward:.4g}）{eq_note}"
+                )
+                rr_color = "#3fb950" if metrics_ok else "#f85149"
+                self._rr_inline_label.setStyleSheet(
+                    f"color: {rr_color}; font-size: 15px; font-weight: bold;"
+                )
                 self._rr_inline_label.setVisible(True)
             else:
-                self._rr_inline_label.setText("盈亏比  —")
+                self._rr_inline_label.setText("盈亏比  —（三价无效）")
+                self._rr_inline_label.setStyleSheet(
+                    "color: #f85149; font-size: 15px; font-weight: bold;"
+                )
                 self._rr_inline_label.setVisible(True)
 
             win_rate = format_estimated_win_rate(decision)

@@ -13,10 +13,13 @@ import urllib.request
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("KKAI_API_KEY", "").strip(),
-    reason="Set KKAI_API_KEY to run live KKAI tests",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not os.environ.get("KKAI_API_KEY", "").strip(),
+        reason="Set KKAI_API_KEY to run live KKAI tests",
+    ),
+]
 
 URL = "https://api.kkone.vip/v1/chat/completions"
 MODEL = "claude-opus-4-5"

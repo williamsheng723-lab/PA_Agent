@@ -93,11 +93,15 @@ class ChartWidget(pg.PlotWidget):
 
         self._update_direction_marker()
 
-    def reset(self) -> None:
-        """Clear all chart items (candles, labels, EMA, overlay lines)."""
+    def clear_decision_overlay(self) -> None:
+        """Remove entry/TP/SL lines and direction marker; keep the current K-line frame."""
         self._overlay.clear_lines(self)
         self._clear_direction_marker()
         self._pending_decision = None
+
+    def reset(self) -> None:
+        """Clear all chart items (candles, labels, EMA, overlay lines)."""
+        self.clear_decision_overlay()
         self._clear_candles_and_labels()
         if self._ema_line is not None:
             self.removeItem(self._ema_line)

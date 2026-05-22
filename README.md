@@ -169,14 +169,29 @@ PA_Agent/
 
 ## 配置文件
 
-配置文件位于 `config/` 目录下，首次运行时自动生成，不会提交到 Git。
+配置文件位于 `config/` 目录下，首次运行时自动生成，**不会**提交到 Git。
 
 | 文件 | 说明 |
 |------|------|
-| `config/settings.json` | 主配置文件，包含 API 设置、界面偏好、分析参数等 |
+| `config/settings.json` | 本机主配置（API Key 经 DPAPI 加密为 `api_key_encrypted`） |
+| `config/settings.example.json` | 可提交到仓库的模板，不含真实密钥 |
 | `config/exception_state.json` | 异常状态记录，用于程序崩溃后的状态恢复 |
 
-> ⚠️ 请勿手动编辑这些文件，除非你了解各字段含义。配置损坏时可删除文件，程序将重新生成默认配置。
+### 防止密钥被 `git push` 到 GitHub
+
+1. 克隆或拉取后执行一次（仅需本机）：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\setup_git_secrets.ps1
+   ```
+   会启用 `.githooks/pre-commit`，在提交前拦截 `settings.json`、日志、分析记录等。
+2. 在 GUI「设置」里填写 API Key，或复制 `config/settings.example.json` 为 `config/settings.json` 后再配置；**不要**把真实 Key 写进会被提交的文档或测试文件。
+3. 默认 `pytest` **不会**跑需真实网络的 `live` 测试；仅在你显式设置环境变量时运行，例如：
+   ```cmd
+   set KKAI_API_KEY=sk-...
+   pytest -m live -v
+   ```
+
+> ⚠️ 请勿手动编辑 `settings.json`，除非你了解各字段含义。配置损坏时可删除该文件，程序将重新生成默认配置。
 
 ---
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from pa_agent.ai.decision_stance import build_decision_stance_guidance, normalize_stance
+from pa_agent.ai.kline_features import compute_kline_geometry_features
 from pa_agent.data.base import KlineFrame
 from pa_agent.records.schema import AnalysisRecord
 
@@ -42,7 +43,8 @@ _THINKING_CONTENT_OUTPUT_RULE = """
 _STAGE1_TAIL_REMINDER = (
     "【最后一步·必做】思考结束后，立即在 assistant 正文 `content` 输出完整阶段一裸 JSON。"
     "思考请用简体中文并尽量简洁；`content` 不得为空。"
-    "若 token 紧张，优先保证 `content` 有 JSON，可缩短思考。"
+    "若 token 紧张：可缩短思考、将 bar_by_bar_summary 缩至 8 根，"
+    "但 gate_trace 与 gate_result 必须写在 JSON 末尾且不可省略。"
 ).strip()
 
 _STAGE2_TAIL_REMINDER = (
@@ -75,6 +77,29 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
   "entry_setup": "",
   "strategy_files_needed": ["下跌通道分析识别.txt", "下跌通道交易策略.txt"],
   "risk_warning": "",
+  "bar_analysis": {
+    "always_in": "long|short|neutral",
+    "last_closed_bar": "K1",
+    "bar_type": "trend_bull|trend_bear|doji|inside|outside_bull|outside_bear|other",
+    "signal_bar": {
+      "bar": "K2",
+      "quality": "strong|medium|weak|invalid",
+      "reason": "信号棒质量判断"
+    },
+    "entry_setup_type": "H1|H2|L1|L2|MTR|wedge|tr_boundary|breakout_pullback|none",
+    "follow_through": "yes|no|pending|failed"
+  },
+  "bar_by_bar_summary": [
+    {
+      "bar": "K1",
+      "role": "structure|signal|entry|confirmation|noise|trap|climax|test",
+      "bar_type": "trend_bull|trend_bear|doji|inside|outside_bull|outside_bear|other",
+      "context_effect": "strengthens_bull|weakens_bull|strengthens_bear|weakens_bear|neutral|transition",
+      "follow_through": "yes|no|pending|failed",
+      "trapped_side": "bulls|bears|both|none|unknown",
+      "reason": "一句话说明该K线对当前市场状态的增量影响"
+    }
+  ],
   "gate_trace": [
     {
       "node_id": "0.1",
@@ -96,11 +121,17 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 在输出诊断 JSON 前，按《二元决策.txt》**依次**评估以下节点，并写入 gate_trace（仅记录你实际评估的节点，通常 6–10 条）：
 §0：0.1 看得懂市场 → 0.2 是否具备继续分析的条件（定性，**不是**交易者方程）
 §1：1.1 数据足够 → 1.2 识别周期 → 1.3 极端混乱
-§2：2.1 惯性方向 → 2.2 大时间框架 → 2.3 多/空/中性（**answer 只能用 是/否/中性**；方向写在 branch：bullish/bearish/neutral，勿写「多头」「空头」作 answer）
+§2：2.1 惯性方向 → 2.2 大时间框架 → 2.3 多/空/中性 → 2.4 Always In 状态 → 2.5 惯性强度（**answer 只能用 是/否/中性**；方向或 AIL/AIS 写在 branch，勿写「多头」「空头」作 answer）
 
 **禁止在阶段一评估：**
 - **0.3**（交易者方程仅为原则；数值检验在阶段二 **10.3**）
 - **§9–§11**（入场、风险、下单均属阶段二）
+
+**逐K摘要硬规则：**
+- 必须输出 `bar_by_bar_summary`，覆盖最近 8–12 根已收盘 K 线（数据不足则覆盖全部；勿超过 12 条以免截断 gate_trace）。
+- 每条只写该 K 线对当前结构的增量作用，不写下单价格、不写止损止盈。
+- K线序号方向：K1 是最新已收盘，K2 是它前一根；判断 K2 的后续跟随时看 K1，判断 K3 的后续跟随时看 K2/K1；K1 的跟随通常为 pending。
+- `bar_type` 必须优先对齐程序提供的 K线几何特征表。
 
 规则：
 - answer 只能是：是 / 否 / 中性 / 等待 / 不适用（**禁止**写「部分」「待确认」「待定」等——部分一致用 **中性**，尚需下一根K线确认用 **等待**）
@@ -146,6 +177,9 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
     "order_direction": "做多|做空|null",
     "order_type": "限价单|突破单|市价单|不下单",
     "entry_price": null,
+    "entry_basis_bar": null,
+    "entry_basis_extreme": null,
+    "entry_rule": null,
     "take_profit_price": null,
     "stop_loss_price": null,
     "reasoning": "",
@@ -164,6 +198,28 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
     "cycle_position": "",
     "direction": "",
     "key_signals": []
+  },
+  "bar_analysis": {
+    "always_in": "long|short|neutral",
+    "last_closed_bar": "K1",
+    "bar_type": "trend_bull|trend_bear|doji|inside|outside_bull|outside_bear|other",
+    "signal_bar": {
+      "bar": "K2",
+      "quality": "strong|medium|weak|invalid",
+      "pattern": "H1|H2|L1|L2|MTR|wedge|tr_boundary|breakout_pullback|none",
+      "reason": "信号棒质量判断"
+    },
+    "entry_bar": {
+      "bar": "K1",
+      "strength": "strong|weak|not_triggered",
+      "follow_through": true,
+      "still_valid": true,
+      "freshness": "fresh|stale|invalid"
+    },
+    "second_entry": {
+      "is_second_entry": true,
+      "type": "H2|L2|MTR|wedge|tr_boundary|trendline|none"
+    }
   },
   "decision_trace": [
     {
@@ -193,16 +249,35 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 阶段一 gate_result=proceed 时，decision_trace 必须遵守**执行顺序**（可跳过不适用分支，但不可乱序）：
 
 1. **§3–§8** 按 cycle_position 走对应结构分支（尖峰/通道/区间/反转/楔形等）
-2. **§9** 入场信号二元检查（9.1→9.5，须先确认信号 K 线收盘）
+2. **§9** 入场信号二元检查（9.0→9.7，须先确认信号 K 线质量、二次入场与入场棒跟随）
 3. **§10** 风险收益（必须按序）：**10.1 止损明确 → 10.2 止损不过大 → 10.3 交易者方程**（勿编造具体手数、合约数或资金规模）
 4. **§11** 下单方式（仅当 10.3 为「是」且拟下单时评估 11.1–11.4）
 5. **§14** 禁止行为清单：下单前快速扫描，触犯任一条 → order_type=不下单
 
 **交易者方程（10.3）规则：**
-- 必须使用已拟定的 entry / stop / target 估算胜率、回报、风险后再判
+- 必须使用 **decision 中已填写的 entry_price / stop_loss_price / take_profit_price** 做数值计算，**禁止**用 K 线收盘、信号棒极点间距或「计划中的 1.8 点/3 点」代替三价
+- 做多：风险点数 = entry − stop，回报点数 = take_profit − entry；做空：风险 = stop − entry，回报 = entry − take_profit
+- 盈亏比 = 回报 ÷ 风险（程序与界面只认此公式；reasoning 中写的 RR 必须与三价一致，否则校验失败）
+- 有下单时：盈亏比不得低于当前交易倾向的底线（保守≥1.5，均衡≥1.2，激进/极度激进≥1.0），且须满足 **胜率%×回报 > (100−胜率)%×风险**
+- 不满足上述任一条 → **10.3 必须判「否」**，order_type=**不下单**，不得输出限价/突破/市价单
 - **10.3 通过之前**不得输出具体下单类型；**10.3 之后**才写 §11
 - 因方程不通过而放弃：terminal.node_id 应为 **10.3**，outcome=reject 或 wait
 - 完成 10.3 后，必须把你在方程中使用的**胜率主观估计**写入 decision.estimated_win_rate（0–100 整数），并在 estimated_win_rate_reasoning 简要说明依据；**禁止**留空或仅从 trace 文字里暗示
+
+**突破单 entry_price 硬规则：**
+- order_type="突破单" 时，必须填写 decision.entry_basis_bar、decision.entry_basis_extreme、decision.entry_rule。
+- 做多突破单：entry_basis_extreme 必须为 "high"，entry_price 必须位于 entry_basis_bar 高点上方 1 跳动或至少明确高于该高点。
+- 做空突破单：entry_basis_extreme 必须为 "low"，entry_price 必须位于 entry_basis_bar 低点下方 1 跳动或至少明确低于该低点。
+- 突破单禁止使用 K 线实体中部、当前价附近、EMA 附近或任意折中价作为 entry_price。
+- 如果无法从 K线表确定依据 K 线极点或 tick size，不得编造中间价；应输出 order_type="不下单"，并说明等待信号棒极点被突破。
+- 限价单/市价单不使用 entry_basis_* 字段，可填 null。
+
+**§9 逐K信号链与新鲜度硬规则：**
+- §9.0–§9.7 必须引用 `bar_analysis.signal_bar.bar`、`bar_analysis.entry_bar.bar` 与阶段一 `bar_by_bar_summary` 中的对应 K 线。
+- 信号棒、入场棒、确认棒必须时间顺序合理：信号棒序号通常大于入场棒序号（更早），入场棒之后的跟随看更新的 K 线。
+- 如果信号棒之后已经出现 2–3 根无跟随、反向强 K、或 `entry_bar.freshness=stale|invalid`，不得继续把旧信号当作新的突破单依据。
+- 如果最新 K1 是 doji、弱入场棒、无跟随或反向确认，必须降低 trade_confidence；除非有非常明确的二次入场/突破测试证据，否则 order_type=不下单。
+- 当 `bar_analysis.signal_bar.quality=weak|invalid` 或 `entry_bar.follow_through=false` 时，若仍下单，必须在 §9 和 reasoning 中明确说明为何该弱点未使信号失效；否则应等待。
 
 **跳过规则：**
 - 无持仓：跳过 §12、§13（不写 trace）
@@ -243,20 +318,27 @@ estimated_win_rate_reasoning：必须简要说明依据（如“宽通道顺势 
 """.strip()
 
 # txt files merged into each stage prompt (order preserved)
+# 二元决策.txt lives in system once — shared by Stage 1 and Stage 2 (avoids ~10k×2 chars/run).
 COMMON_SYSTEM_PROMPT_TXT_FILES: tuple[str, ...] = (
     "提示词大纲_人设与思维方式.txt",
+    "二元决策.txt",
 )
 
 STAGE1_TASK_PROMPT_TXT_FILES: tuple[str, ...] = (
     "市场诊断框架.txt",
-    "二元决策.txt",
     "文件16-K线信号识别.txt",
+    "逐棒分析检查单.txt",
 )
 
 STAGE2_BASE_PROMPT_TXT_FILES: tuple[str, ...] = (
-    "二元决策.txt",
+    "逐棒分析检查单.txt",
+    "文件16-K线信号识别.txt",
     "文件17-止损和止盈与仓位管理.txt",
 )
+
+
+def _fmt_feature(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.3f}"
 
 
 def stage1_prompt_txt_files() -> list[str]:
@@ -264,10 +346,15 @@ def stage1_prompt_txt_files() -> list[str]:
     return [*COMMON_SYSTEM_PROMPT_TXT_FILES, *STAGE1_TASK_PROMPT_TXT_FILES]
 
 
-def stage2_prompt_txt_files(strategy_files: list[str] | None = None) -> list[str]:
-    """Return ordered .txt filenames injected in the Stage 2 continuation."""
+def stage2_user_task_txt_files(strategy_files: list[str] | None = None) -> list[str]:
+    """Return .txt filenames loaded into the Stage 2 user turn only."""
     routed = [f for f in (strategy_files or []) if f]
-    return [STAGE2_BASE_PROMPT_TXT_FILES[0], *routed, STAGE2_BASE_PROMPT_TXT_FILES[1]]
+    return [*routed, *STAGE2_BASE_PROMPT_TXT_FILES]
+
+
+def stage2_prompt_txt_files(strategy_files: list[str] | None = None) -> list[str]:
+    """Return all .txt files relevant to Stage 2 (system common + user task), for UI/debug."""
+    return [*COMMON_SYSTEM_PROMPT_TXT_FILES, *stage2_user_task_txt_files(strategy_files)]
 
 
 # ── PromptAssembler ────────────────────────────────────────────────────────────
@@ -318,6 +405,33 @@ class PromptAssembler:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _render_kline_feature_table(frame: KlineFrame, limit: int | None = None) -> str:
+        """Render方案 A single-bar geometry features for prompt grounding."""
+        lines = [
+            "序号 | 类型          | 实体比 | 上影比 | 下影比 | 收盘位置 | Range/ATR | EMA关系 | 与前棒重叠 | ii/iii | ioi | 微双 | 缺口 | EMA缺口数 | 近5突破 | 后续",
+            "-----+---------------+--------+--------+--------+----------+-----------+---------+------------+--------+-----+------+-------+-----------+---------+------",
+        ]
+        for feat in compute_kline_geometry_features(frame, limit=limit):
+            lines.append(
+                f"{feat.seq:<4} | {feat.bar_type:<13} | "
+                f"{_fmt_feature(feat.body_ratio):<6} | "
+                f"{_fmt_feature(feat.upper_wick_ratio):<6} | "
+                f"{_fmt_feature(feat.lower_wick_ratio):<6} | "
+                f"{_fmt_feature(feat.close_position):<8} | "
+                f"{_fmt_feature(feat.range_atr_ratio):<9} | "
+                f"{feat.ema_relation:<7} | "
+                f"{_fmt_feature(feat.overlap_prev_ratio):<10} | "
+                f"{feat.inside_sequence:<6} | "
+                f"{str(feat.ioi_pattern):<3} | "
+                f"{feat.micro_double:<4} | "
+                f"{feat.gap_bar:<5} | "
+                f"{feat.ema_gap_count:<9} | "
+                f"{feat.breakout_prev:<7} | "
+                f"{feat.follow_through_1_2}"
+            )
+        return "\n".join(lines)
+
     # ── Stage 1 ───────────────────────────────────────────────────────────────
 
     def build_stage1(self, frame: KlineFrame) -> list[dict]:
@@ -362,6 +476,7 @@ class PromptAssembler:
         ]
         stage1_context = "\n\n---\n\n".join(p for p in stage1_parts if p)
         kline_table = self._render_kline_table(frame)
+        feature_table = self._render_kline_feature_table(frame)
         n_bars = len(frame.bars)
         return (
             "## 阶段一任务\n\n"
@@ -374,6 +489,8 @@ class PromptAssembler:
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
             f"## K线数据(序号1=最新已收盘K线,序号越大越早;不含当前未收盘K线)\n\n"
             f"{kline_table}\n\n"
+            "## K线几何特征(程序预计算，仅作客观辅助；类型为单棒分类，不替代周期判断)\n\n"
+            f"{feature_table}\n\n"
             f"请根据以上数据，严格输出阶段一 JSON 诊断结果。\n\n"
             f"{_STAGE1_TAIL_REMINDER}"
         )
@@ -393,7 +510,9 @@ class PromptAssembler:
         n_bars = len(frame.bars)
         new_count = max(0, min(new_bar_count, n_bars))
         new_kline_table = self._render_kline_table(frame, limit=new_count)
+        new_feature_table = self._render_kline_feature_table(frame, limit=new_count)
         full_kline_table = self._render_kline_table(frame)
+        full_feature_table = self._render_kline_feature_table(frame)
         previous_summary = {
             "meta": previous_record.meta.model_dump(),
             "stage1_diagnosis": previous_record.stage1_diagnosis or {},
@@ -419,8 +538,12 @@ class PromptAssembler:
             f"```json\n{json.dumps(previous_summary, ensure_ascii=False, indent=2)}\n```\n\n"
             f"## 新增 K线数据(共{new_count}根，序号1=最新已收盘)\n\n"
             f"{new_kline_table}\n\n"
+            f"## 新增 K线几何特征(共{new_count}根)\n\n"
+            f"{new_feature_table}\n\n"
             f"## 当前完整 K线数据(共{n_bars}根，用于必要时复核整体结构)\n\n"
             f"{full_kline_table}\n\n"
+            f"## 当前完整 K线几何特征(用于逐棒辅助，不替代周期判断)\n\n"
+            f"{full_feature_table}\n\n"
             "请基于上一轮结论、新增K线和当前完整K线，严格输出更新后的阶段一 JSON 诊断结果。\n\n"
             f"{_STAGE1_TAIL_REMINDER}"
         )
@@ -499,9 +622,11 @@ class PromptAssembler:
     ) -> str:
         """Build the Stage 2 task turn for standalone or continuation mode."""
         stance_block = build_decision_stance_guidance(normalize_stance(decision_stance))
+        transition_block = self._render_transition_guidance(stage1_json)
         stage2_parts = [
             stance_block,
-            *(self._load(name) for name in stage2_prompt_txt_files(strategy_files)),
+            transition_block,
+            *(self._load(name) for name in stage2_user_task_txt_files(strategy_files)),
         ]
         if experience_entries:
             stage2_parts.append(self._render_experience(experience_entries))
@@ -509,6 +634,7 @@ class PromptAssembler:
         stage2_context = "\n\n---\n\n".join(p for p in stage2_parts if p)
 
         kline_table = self._render_kline_table(frame)
+        feature_table = self._render_kline_feature_table(frame)
         gate_result = stage1_json.get("gate_result", "proceed")
         gate_trace = stage1_json.get("gate_trace") or []
         gate_block = ""
@@ -520,7 +646,10 @@ class PromptAssembler:
 
         n_bars = len(frame.bars)
         kline_block = (
-            f"## K线数据(与阶段一相同, 共{n_bars}根；各节点 bar_range 由你据实填写)\n\n{kline_table}\n\n"
+            f"## K线数据(与阶段一相同, 共{n_bars}根；各节点 bar_range 由你据实填写)\n\n"
+            f"{kline_table}\n\n"
+            "## K线几何特征(程序预计算，仅作逐棒客观辅助；不得替代交易者方程)\n\n"
+            f"{feature_table}\n\n"
             if include_kline_table
             else f"## K线数据\n\n沿用上一轮阶段一用户消息中的同一份 K线数据，共 {n_bars} 根；各节点 bar_range 由你据实填写。\n\n"
         )
@@ -546,6 +675,29 @@ class PromptAssembler:
     ) -> str:
         """Return the shared system prompt used by Stage 2 requests."""
         return self._build_common_system_prompt()
+
+    @staticmethod
+    def _render_transition_guidance(stage1_json: dict) -> str:
+        """Render dynamic risk guidance from Stage 1 market_phase fields."""
+        if stage1_json.get("market_phase") != "transitioning":
+            return ""
+        risk = stage1_json.get("transition_risk") or "medium"
+        if risk == "high":
+            size = "正常仓位的50%"
+            selectivity = "只接受最清晰的二次入场、突破回踩或边界信号"
+        elif risk == "medium":
+            size = "正常仓位的75%"
+            selectivity = "选择性入场，放弃弱信号和中间位置"
+        else:
+            size = "小幅降低"
+            selectivity = "保持正常流程，但在 reason 中说明状态转换风险"
+        return (
+            "## 状态转换期风险指导\n\n"
+            f"阶段一判断 market_phase=transitioning，transition_risk={risk}。\n"
+            f"- 仓位倾向：{size}。\n"
+            f"- 入场选择：{selectivity}。\n"
+            "- 不因为状态转换而跳过 §9、§10、§14；只是提高信号质量门槛并降低交易频率。"
+        )
 
     @staticmethod
     def _render_experience(entries: list[Any]) -> str:

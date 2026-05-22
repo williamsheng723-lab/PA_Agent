@@ -38,8 +38,13 @@ _RANGE_FILES = [
 
 _WEDGE_FILE = "文件14-楔形形态分析交易.txt"
 _REVERSAL_FILE = "文件15-二次入场机会.txt"
+_BREAKOUT_FAILURE_FILE = "文件18-突破失败与突破测试.txt"
+_H1H2_FILE = "文件19-H1H2-L1L2计数.txt"
+_ALWAYS_IN_FILE = "文件20-AlwaysIn与20GB.txt"
+_BARBWIRE_FILE = "文件21-铁丝网与无交易环境.txt"
+_MAGNET_FILE = "文件22-信号失败后的磁力位.txt"
 
-# All 17 valid file names (used for dedup validation)
+# All valid file names (used for dedup validation)
 _ALL_VALID_FILES: frozenset[str] = frozenset([
     "提示词大纲_人设与思维方式.txt",
     "市场诊断框架.txt",
@@ -58,6 +63,11 @@ _ALL_VALID_FILES: frozenset[str] = frozenset([
     "震荡区间交易策略.txt",
     "文件14-楔形形态分析交易.txt",
     "文件15-二次入场机会.txt",
+    "文件18-突破失败与突破测试.txt",
+    "文件19-H1H2-L1L2计数.txt",
+    "文件20-AlwaysIn与20GB.txt",
+    "文件21-铁丝网与无交易环境.txt",
+    "文件22-信号失败后的磁力位.txt",
 ])
 
 _CHANNEL_STATES = frozenset(["micro_channel", "tight_channel", "normal_channel", "broad_channel"])
@@ -73,26 +83,81 @@ def route_strategy_files(stage1_json: dict[str, Any]) -> list[str]:
 
     Returns:
         List of file names to load, in the order they should appear in the
-        Stage 2 system prompt. Always a subset of the 17 known files.
+        Stage 2 system prompt. Always a subset of the known prompt files.
         Empty list means "do not trade" (extreme_tr / unknown).
     """
     cp = stage1_json.get("cycle_position", "unknown")
     direction = stage1_json.get("direction", "neutral")
-    patterns = stage1_json.get("detected_patterns", []) or []
+    patterns = [
+        str(p).strip().lower()
+        for p in (stage1_json.get("detected_patterns", []) or [])
+    ]
+    spike_stage = stage1_json.get("spike_stage")
+    alternative_cp = stage1_json.get("alternative_cycle_position")
 
     files: list[str] = []
+    files.extend(_base_files_for_cycle(cp, direction, spike_stage=spike_stage))
+
+    if alternative_cp and alternative_cp != cp:
+        files.extend(_base_files_for_cycle(str(alternative_cp), direction, spike_stage=None))
+
+    # ── Pattern overlays ──────────────────────────────────────────────────────
+    if "wedge" in patterns:
+        files.append(_WEDGE_FILE)
+    if (
+        cp in _CHANNEL_STATES
+        or "reversal_attempt" in patterns
+        or "mtr" in patterns
+        or "final_flag" in patterns
+        or "h2" in patterns
+        or "l2" in patterns
+    ):
+        files.append(_REVERSAL_FILE)
+    if cp in _CHANNEL_STATES or any(p in patterns for p in ("h1", "h2", "l1", "l2")):
+        files.append(_H1H2_FILE)
+    if any(
+        p in patterns
+        for p in ("breakout_failure", "failed_breakout", "breakout_test", "breakout_pullback")
+    ):
+        files.append(_BREAKOUT_FAILURE_FILE)
+    if any(p in patterns for p in ("always_in", "ail", "ais", "20gb", "gap_bar")):
+        files.append(_ALWAYS_IN_FILE)
+    if cp in _RANGE_STATES or any(p in patterns for p in ("barbwire", "wire", "overlap", "middle_range")):
+        files.append(_BARBWIRE_FILE)
+    if any(
+        p in patterns
+        for p in ("failed_signal", "breakout_failure", "failed_breakout", "magnet", "trapped_traders")
+    ):
+        files.append(_MAGNET_FILE)
+
+    # ── Stable dedup (preserve first occurrence) ──────────────────────────────
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            deduped.append(f)
+
+    return deduped
+
+
+def _base_files_for_cycle(
+    cp: str,
+    direction: str,
+    *,
+    spike_stage: Any = None,
+) -> list[str]:
+    """Return base strategy files before pattern overlays."""
+    files: list[str] = []
+
+    # spike transitioning is already behaving like a channel; ending keeps spike
+    # context but preloads channel rules for the likely spike-and-channel shift.
+    if cp == "spike" and spike_stage == "transitioning":
+        return _channel_files(direction)
 
     # ── Channel states ────────────────────────────────────────────────────────
     if cp in _CHANNEL_STATES:
-        if direction == "bullish":
-            files.extend(_BULLISH_CHANNEL_FILES)
-        elif direction == "bearish":
-            files.extend(_BEARISH_CHANNEL_FILES)
-        else:
-            logger.warning(
-                "Channel state %r with neutral direction — no directional strategy files loaded", cp
-            )
-        files.append(_CHANNEL_WIDTH_FILE)
+        files.extend(_channel_files(direction))
 
     # ── Spike state ───────────────────────────────────────────────────────────
     elif cp == "spike":
@@ -102,6 +167,8 @@ def route_strategy_files(stage1_json: dict[str, Any]) -> list[str]:
             files.extend(_BEARISH_SPIKE_FILES)
         else:
             logger.warning("Spike with neutral direction — no spike strategy files loaded")
+        if spike_stage == "ending":
+            files.extend(_channel_files(direction))
 
     # ── Range states ──────────────────────────────────────────────────────────
     elif cp in _RANGE_STATES:
@@ -114,18 +181,16 @@ def route_strategy_files(stage1_json: dict[str, Any]) -> list[str]:
     else:
         logger.warning("Unknown cycle_position %r — no strategy files loaded", cp)
 
-    # ── Pattern overlays ──────────────────────────────────────────────────────
-    if "wedge" in patterns:
-        files.append(_WEDGE_FILE)
-    if "reversal_attempt" in patterns:
-        files.append(_REVERSAL_FILE)
+    return files
 
-    # ── Stable dedup (preserve first occurrence) ──────────────────────────────
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for f in files:
-        if f not in seen:
-            seen.add(f)
-            deduped.append(f)
 
-    return deduped
+def _channel_files(direction: str) -> list[str]:
+    files: list[str] = []
+    if direction == "bullish":
+        files.extend(_BULLISH_CHANNEL_FILES)
+    elif direction == "bearish":
+        files.extend(_BEARISH_CHANNEL_FILES)
+    else:
+        logger.warning("Channel-like state with neutral direction — no directional strategy files loaded")
+    files.append(_CHANNEL_WIDTH_FILE)
+    return files

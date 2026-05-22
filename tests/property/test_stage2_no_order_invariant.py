@@ -38,14 +38,64 @@ def _base_decision(**overrides) -> dict:
 
 
 def _base_stage2(decision: dict) -> dict:
-    return {
+    is_no_order = decision.get("order_type") == "不下单"
+    trace = [
+        {
+            "node_id": "10.3",
+            "question": "交易者方程是否通过？",
+            "answer": "否" if is_no_order else "是",
+            "reason": "test",
+            "bar_range": "K2-K1",
+        }
+    ]
+    if not is_no_order:
+        trace.append(
+            {
+                "node_id": "11.1",
+                "question": "是趋势 / 尖峰状态吗？",
+                "answer": "是",
+                "reason": "test",
+                "bar_range": "K2-K1",
+            }
+        )
+    obj = {
         "decision": decision,
         "diagnosis_summary": {
             "cycle_position": "normal_channel",
             "direction": "bullish",
             "key_signals": [],
         },
+        "decision_trace": trace,
+        "terminal": {
+            "node_id": "10.3" if is_no_order else "11.1",
+            "outcome": "reject" if is_no_order else "trade",
+            "label": "test",
+        },
     }
+    if not is_no_order:
+        obj["bar_analysis"] = {
+            "always_in": "long",
+            "last_closed_bar": "K1",
+            "bar_type": "trend_bull",
+            "signal_bar": {
+                "bar": "K2",
+                "quality": "strong",
+                "pattern": "H1",
+                "reason": "test",
+            },
+            "entry_bar": {
+                "bar": "K1",
+                "strength": "strong",
+                "follow_through": True,
+                "still_valid": True,
+                "freshness": "fresh",
+            },
+            "second_entry": {
+                "is_second_entry": False,
+                "type": "none",
+            },
+        }
+    return obj
 
 
 # ── 不下单 side ────────────────────────────────────────────────────────────────
@@ -101,9 +151,52 @@ def test_with_order_all_fields_present_accepted(order_type: str) -> None:
         stop_loss_price=2620.0,
         estimated_win_rate=52,
     )
+    if order_type == "突破单":
+        decision.update(
+            {
+                "entry_basis_bar": "K2",
+                "entry_basis_extreme": "high",
+                "entry_rule": "做多突破单挂在K2高点上方1跳动",
+            }
+        )
     obj = _base_stage2(decision)
     result = validator.validate("stage2", json.dumps(obj))
     assert isinstance(result, Ok), f"Expected Ok for {order_type}, got {result}"
+
+
+def test_breakout_order_requires_extreme_basis() -> None:
+    decision = _base_decision(
+        order_type="突破单",
+        order_direction="做多",
+        entry_price=2650.0,
+        take_profit_price=2700.0,
+        stop_loss_price=2620.0,
+        estimated_win_rate=52,
+    )
+    obj = _base_stage2(decision)
+    result = validator.validate("stage2", json.dumps(obj))
+    assert isinstance(result, ValidationError)
+    assert result.category == "c"
+    assert "entry_basis_bar" in result.missing_fields
+
+
+def test_breakout_order_direction_must_match_extreme() -> None:
+    decision = _base_decision(
+        order_type="突破单",
+        order_direction="做多",
+        entry_price=2650.0,
+        take_profit_price=2700.0,
+        stop_loss_price=2620.0,
+        estimated_win_rate=52,
+        entry_basis_bar="K2",
+        entry_basis_extreme="low",
+        entry_rule="错误：做多突破单不应挂在低点下方",
+    )
+    obj = _base_stage2(decision)
+    result = validator.validate("stage2", json.dumps(obj))
+    assert isinstance(result, ValidationError)
+    assert result.category == "c"
+    assert "decision.entry_basis_extreme" in result.invalid_fields
 
 
 @given(order_type=st.sampled_from(_ORDER_TYPES_WITH_TRADE))

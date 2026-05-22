@@ -59,4 +59,5 @@ markers = [
     "property: property-based tests (hypothesis)",
     "integration: integration tests crossing module boundaries",
     "e2e: end-to-end smoke tests",
+    "live: requires real API key via environment variable (never uses config/settings.json)",
 ]
