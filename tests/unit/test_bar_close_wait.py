@@ -40,6 +40,13 @@ def test_seconds_until_bar_closes() -> None:
     assert seconds_until_bar_closes(ts_open, "5m", now_ms=ts_open + 300_000) == 0
 
 
+def test_seconds_until_bar_closes_offset_multiple_durations() -> None:
+    """If ts_open has a constant offset by whole durations, countdown must not drift."""
+    now_ms = 10_000_000
+    ts_open_ms = now_ms + 8 * 3600 * 1000  # offset by 8 hours
+    assert seconds_until_bar_closes(ts_open_ms, "1m", now_ms=now_ms) == 60
+
+
 def test_forming_bar_has_closed_when_ts_changes() -> None:
     now_ms = int(time.time() * 1000)
     waited = now_ms - 120_000

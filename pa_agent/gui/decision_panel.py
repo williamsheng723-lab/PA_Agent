@@ -166,6 +166,11 @@ class DecisionPanel(QWidget):
         title.setObjectName("toolbarTitle")
         layout.addWidget(title)
 
+        disclaimer = QLabel("分析仅供参考，不构成投资建议")
+        disclaimer.setObjectName("mutedLabel")
+        disclaimer.setWordWrap(True)
+        layout.addWidget(disclaimer)
+
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)

@@ -152,7 +152,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("PA Agent — Trading Terminal")
+        self.setWindowTitle(
+            "PA Agent — Trading Terminal（分析仅供参考，不构成投资建议）"
+        )
         self.resize(1440, 900)
         self._ctx = ctx
         self._worker: _AnalysisWorker | None = None
@@ -412,6 +414,15 @@ class MainWindow(QMainWindow):
         )
         self._api_key_alert_label.hide()
         outer_layout.addWidget(self._api_key_alert_label)
+
+        # Risk disclaimer (UI-only; never included in AI prompts)
+        self._disclaimer_label = QLabel("分析仅供参考，不构成投资建议")
+        self._disclaimer_label.setObjectName("mutedLabel")
+        self._disclaimer_label.setWordWrap(True)
+        self._disclaimer_label.setStyleSheet(
+            "color: #8b949e; font-size: 11px; padding: 2px 0;"
+        )
+        outer_layout.addWidget(self._disclaimer_label)
 
         status_row = QHBoxLayout()
         status_row.addStretch()
@@ -985,7 +996,13 @@ class MainWindow(QMainWindow):
 
     def _refresh_chart_once(self) -> None:
         """Apply one immediate chart refresh (e.g. after resuming)."""
-        self._pull_chart_frame_from_source()
+        frame = self._pull_chart_frame_from_source()
+        chart = getattr(self, "_chart_widget", None)
+        if frame is None or chart is None:
+            return
+        # User-triggered refresh/resume should always re-fit to the latest frame,
+        # otherwise the chart can remain panned/zoomed away from the newest bars.
+        chart.set_frame_now(frame, fit_view=True)
 
     def _chart_wants_forming_bar(self) -> bool:
         """Show semi-virtual forming bar on chart when live refresh is active."""
@@ -2272,6 +2289,55 @@ class MainWindow(QMainWindow):
             body += f"\n\n摘要：{detail}"
         QMessageBox.warning(self, "需要排查错误", body)
 
+    def _maybe_show_truncation_help_dialog(self, exc_info: dict | None) -> None:
+        """If validation indicates truncation/context shortage, prompt user actions."""
+        if not exc_info or not isinstance(exc_info, dict):
+            return
+        msg = str(exc_info.get("message", "") or "")
+        if not msg:
+            return
+
+        # Heuristic: two_stage.py enriches messages with clear truncation keywords.
+        is_trunc = any(
+            token in msg
+            for token in (
+                "被截断",
+                "未闭合对象",
+                "正文 content 为空",
+                "思考占满输出额度",
+                "思考在输出阶段",
+            )
+        )
+        if not is_trunc:
+            return
+
+        # Prevent repeated popups for the same error message.
+        key = msg[:300]
+        if getattr(self, "_last_truncation_hint_key", None) == key:
+            return
+        self._last_truncation_hint_key = key
+
+        from PyQt6.QtWidgets import QMessageBox
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("模型输出可能被截断")
+        box.setText(
+            "本次分析的 JSON 正文可能因「模型上下文/输出额度不足」而被截断，"
+            "导致校验失败。"
+        )
+        box.setInformativeText(
+            "建议操作：\n"
+            "1) 换一个更长上下文/更稳的模型；或\n"
+            "2) 在「设置」里关闭「Thinking」后重试。\n\n"
+            f"诊断摘要：{key}"
+        )
+        btn_open = box.addButton("打开设置", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("知道了", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() == btn_open:
+            self._open_settings_dialog()
+
     def _on_analysis_error(self, message: str) -> None:
         """Unhandled exception in the analysis worker thread."""
         self._last_analysis_had_error = True
@@ -2337,6 +2403,10 @@ class MainWindow(QMainWindow):
                 "raw_response": s2_raw,
                 "validation_info": s2_validation,
             })
+
+        # If the analysis failed due to truncation/context issues, prompt actionable help.
+        if exc_info:
+            self._maybe_show_truncation_help_dialog(exc_info)
 
             if exc_info:
                 debug.add_turn({

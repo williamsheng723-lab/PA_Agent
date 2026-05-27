@@ -115,6 +115,11 @@ class AIStreamPanel(QWidget):
         self._stats_label.setObjectName("mutedLabel")
         layout.addWidget(self._stats_label)
 
+        self._disclaimer_label = QLabel("分析仅供参考，不构成投资建议")
+        self._disclaimer_label.setObjectName("mutedLabel")
+        self._disclaimer_label.setWordWrap(True)
+        layout.addWidget(self._disclaimer_label)
+
         layout.addLayout(self._build_token_bar())
         layout.addWidget(self._build_input_area())
 

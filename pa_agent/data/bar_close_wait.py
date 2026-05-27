@@ -55,10 +55,26 @@ def seconds_until_bar_closes(
         return None
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    close_ms = int(ts_open_ms) + duration_s * 1000
-    remaining_ms = close_ms - int(now_ms)
-    if remaining_ms <= 0:
-        return 0
+    # NOTE:
+    # Some data sources provide ``ts_open`` with a fixed timezone/base offset.
+    # Using absolute ``close_ms = ts_open + duration`` would then make the
+    # countdown drift by that whole offset (e.g. ~8h).
+    # Instead, compute remaining time within the duration window by taking
+    # elapsed % duration. This is robust to constant offsets.
+    duration_ms = duration_s * 1000
+    elapsed_ms = int(now_ms) - int(ts_open_ms)
+    if elapsed_ms == 0:
+        return duration_s
+
+    # remainder in [0, duration_ms)
+    remainder_ms = elapsed_ms % duration_ms
+    if remainder_ms == 0:
+        # now exactly on a boundary:
+        # - elapsed > 0 → bar already closed
+        # - elapsed < 0 → bar "would close" a full duration away (offset case)
+        return 0 if elapsed_ms > 0 else duration_s
+
+    remaining_ms = duration_ms - remainder_ms
     return int(math.ceil(remaining_ms / 1000))
 
 
