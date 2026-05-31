@@ -1,4 +1,4 @@
-﻿【文件定位】本文件职责：在已确认震荡区间中，给出低买高卖刮头皮的具体方案。在诊断结果为震荡区间（trading_range）或趋势型交易区间（trending_tr）时加载。
+【文件定位】本文件职责：在已确认震荡区间中，给出低买高卖刮头皮的具体方案。在诊断结果为震荡区间（trading_range）或趋势型交易区间（trending_tr）时加载。
 
 ⚠️ 【trending_tr vs trading_range 分支处理】
 trending_tr（趋势型交易区间）与普通 trading_range（无方向交易区间）使用本文件同一策略框架，但有以下关键差异必须注意：

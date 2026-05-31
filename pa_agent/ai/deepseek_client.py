@@ -57,6 +57,14 @@ def _is_kkai_openai_proxy(base_url: str) -> bool:
     return "kkone.vip" in url
 
 
+# MiniMax API: max_tokens must be <= 196608.
+_MINIMAX_MAX_OUTPUT_TOKENS = 196_608
+
+def _is_minimax(base_url: str) -> bool:
+    url = (base_url or "").lower()
+    return "minimax" in url or "api.minimax.io" in url
+
+
 def _is_packyapi(base_url: str) -> bool:
     return "packyapi.com" in (base_url or "").lower()
 
@@ -146,6 +154,8 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
         return _PACKY_CLAUDE_MAX_OUTPUT_TOKENS
     if _is_deepseek_native(settings.base_url):
         return _DEEPSEEK_MAX_OUTPUT_TOKENS
+    if _is_minimax(settings.base_url):
+        return _MINIMAX_MAX_OUTPUT_TOKENS
     return _PRACTICAL_UNLIMITED_MAX_TOKENS
 
 

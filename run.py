@@ -1,17 +1,23 @@
-"""直接运行此文件启动 PA Agent。
+"""Direct run this file to launch PA Agent.
 
-用法：
+Usage:
     python run.py
 
-或者双击 run.py（如果系统关联了 Python）。
+Or double-click run.py (if Python is associated).
 """
 import sys
 import os
 
-# 确保 PA_Agent 目录在 sys.path 里（当从其他目录运行时也能找到包）
+# Ensure PA_Agent directory is in sys.path (works when run from any directory)
 _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
+
+# Set UTF-8 output encoding for Windows console (avoids GBK errors on Unicode chars)
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from pa_agent.main import main
 

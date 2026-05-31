@@ -24,8 +24,18 @@ STAGE2_VALIDATION_AUTO_RETRY = False
 
 import dataclasses
 import logging
+import sys
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+# Windows console UTF-8 wrapper (avoids GBK errors on Unicode like ⚠️)
+if sys.platform == "win32":
+    import io
+    if hasattr(sys.stdout, "buffer"):
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 if TYPE_CHECKING:
     from pa_agent.ai.deepseek_client import DeepSeekClient
