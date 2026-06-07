@@ -101,18 +101,26 @@ def _strip_fences(text: str) -> str:
 
     # ── 清洗模型输出的非标准 Unicode 引号 / 控制字符 ──
     _SMART_QUOTE_MAP = {
-        "\u201c": '"',
-        "\u201d": '"',
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u2013": "-",
-        "\u2014": "-",
+        "\u201c": '"',   # " → "
+        "\u201d": '"',   # " → "
+        "\u2018": "'",   # ' → '
+        "\u2019": "'",   # ' → '
+        "\u2013": "-",   # en-dash
+        "\u2014": "-",   # em-dash
     }
     for bad, good in _SMART_QUOTE_MAP.items():
         t = t.replace(bad, good)
+    # 去掉除 \t \n \r 外的控制字符（0x00-0x1f 除了这三个）
     t = "".join(ch for ch in t if ch >= " " or ch in "\t\n\r")
 
-    # Fully fenced ```json ... ```
+    # ── Priority: find an embedded ```json ... ``` fence anywhere in text ──
+    # Handles the case where the model outputs prose first, then a fenced block.
+    m_embedded = _FENCE_RE.search(t)
+    if m_embedded:
+        t = m_embedded.group(1).strip()
+        return _repair_unescaped_quotes(_repair_semicolon_separator(_extract_outer_json_object(t)))
+
+    # Fully fenced ```json ... ``` starting at top
     if t.startswith("```"):
         m = _FENCE_RE.search(t)
         if m:
@@ -123,7 +131,7 @@ def _strip_fences(text: str) -> str:
     # Common model mistake: raw JSON + trailing ``` only
     t = _TRAILING_FENCE_RE.sub("", t).strip()
 
-    return _repair_unescaped_quotes(_extract_outer_json_object(t))
+    return _repair_unescaped_quotes(_repair_semicolon_separator(_extract_outer_json_object(t)))
 
 
 # ── Unescaped quote repair ────────────────────────────────────────────────────
@@ -180,6 +188,48 @@ def _repair_unescaped_quotes(text: str) -> str:
     return "".join(out)
 
 
+def _repair_semicolon_separator(text: str) -> str:
+    """Replace stray semicolons used as field separators outside JSON strings.
+
+    Models occasionally write ``"field": "value";`` instead of ``"field": "value",``
+    which is a common typo.  Only replaces ``;`` that appears in struct-separator
+    position (outside a string, followed by optional whitespace then ``"`` or ``}``).
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ";":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in ('"', '}', ']'):
+                out.append(",")
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 # ── Truncated JSON repair ───────────────────────────────────────────────────────
 
 def _balance_json_brackets(text: str) -> str:
@@ -211,11 +261,42 @@ def _balance_json_brackets(text: str) -> str:
     return text + closers
 
 
-def _inject_stage1_missing_tail(text: str) -> str:
-    """Append minimal gate fields when the model stopped after bar_by_bar_summary."""
-    lowered = text.lower()
-    if '"gate_result"' in lowered or '"gate_trace"' in lowered:
-        return text
+def _inject_stage2_no_json_stub(raw_text: str) -> str | None:
+    """When stage2 content is pure prose (model forgot to output JSON),
+    return a minimal 不下单 JSON stub so downstream validation can continue
+    and show a more specific error instead of category-d.
+
+    Returns None if the text already contains a JSON object.
+    """
+    stripped = raw_text.strip()
+    # If there's already a '{' somewhere, let normal extraction handle it.
+    if "{" in stripped:
+        return None
+    # Only inject when it looks like a stage2 reasoning dump.
+    # Key markers: the text is Chinese prose, possibly ending with a separator.
+    if len(stripped) < 20:
+        return None
+    stub = (
+        '{"_auto_stub":true,'
+        '"decision":{"order_direction":null,"order_type":"不下单",'
+        '"entry_price":null,"entry_basis_bar":null,"entry_basis_extreme":null,'
+        '"entry_rule":null,"take_profit_price":null,"stop_loss_price":null,'
+        '"reasoning":"模型未输出JSON，程序自动注入不下单骨架（请重新提交分析）",'
+        '"diagnosis_confidence":0,"diagnosis_confidence_reasoning":"",'
+        '"trade_confidence":0,"trade_confidence_reasoning":"",'
+        '"estimated_win_rate":null,"estimated_win_rate_reasoning":"",'
+        '"key_factors":[],"watch_points":[],"risk_assessment":"",'
+        '"invalidation_condition":""},'
+        '"diagnosis_summary":{"cycle_position":"unknown","direction":"neutral","key_signals":[]},'
+        '"bar_analysis":{"always_in":"neutral","last_closed_bar":"K1","bar_type":"other",'
+        '"signal_bar":{"bar":null,"quality":"invalid","pattern":"none","reason":"无JSON输出"},'
+        '"entry_bar":{"bar":null,"strength":"not_triggered","follow_through":false,'
+        '"still_valid":false,"freshness":"invalid"},'
+        '"second_entry":{"is_second_entry":false,"type":"none"}},'
+        '"decision_trace":[],'
+        '"terminal":{"node_id":"AUTO","outcome":"wait","label":"模型未输出JSON，自动降级为等待"}}'
+    )
+    return stub
 
     tail = text.rstrip()
     if not tail.endswith((",", "]", "}")):
@@ -297,12 +378,32 @@ class JsonValidator:
         # ── Category d: plain text (no JSON at all) ───────────────────────────
         stripped = _strip_fences(raw_text)
         if not stripped.startswith("{") and not stripped.startswith("["):
-            return ValidationError(
-                category="d",
-                stage=stage,
-                raw_text=raw_text,
-                message="Response is plain text, not JSON",
-            )
+            # Stage 2 special case: model output pure prose (forgot JSON).
+            # Inject a minimal 不下单 stub so the user gets a clear "model
+            # failed to output JSON" message via the normalizer rather than a
+            # generic category-d error.
+            if stage == "stage2":
+                stub = _inject_stage2_no_json_stub(raw_text)
+                if stub is not None:
+                    logger.warning(
+                        "Stage2 response contained no JSON; injecting 不下单 stub. "
+                        "Raw length=%d", len(raw_text)
+                    )
+                    stripped = stub
+                else:
+                    return ValidationError(
+                        category="d",
+                        stage=stage,
+                        raw_text=raw_text,
+                        message="Response is plain text, not JSON",
+                    )
+            else:
+                return ValidationError(
+                    category="d",
+                    stage=stage,
+                    raw_text=raw_text,
+                    message="Response is plain text, not JSON",
+                )
 
         # ── Category a: syntax error ──────────────────────────────────────────
         try:
@@ -368,6 +469,7 @@ class JsonValidator:
                 normalization_mode=norm_mode,
                 kline_frame=kline_frame,
                 decision_stance=decision_stance,
+                stage1_json=stage1_json,
             )
 
         # ── Schema validation (b and c) ───────────────────────────────────────
@@ -398,12 +500,19 @@ class JsonValidator:
         if stage == "stage1":
             from pa_agent.ai.decision_tree import validate_gate_result_consistency
             from pa_agent.ai.coherence_checks import (
+                auto_fix_bar_by_bar_types,
                 validate_incremental_stage1_coherence,
                 validate_stage1_coherence,
             )
 
             for msg in validate_gate_result_consistency(obj):
                 invalid.append(f"gate:{msg}")
+            # Auto-correct contradicting bar_type values before validation so
+            # minor model slips (writing trend_bull when program says trend_bear)
+            # don't cause the whole analysis to fail.
+            for msg in auto_fix_bar_by_bar_types(obj, kline_frame=kline_frame):
+                import logging as _logging
+                _logging.getLogger(__name__).info("stage1 %s", msg)
             for msg in validate_stage1_coherence(
                 obj,
                 kline_frame=kline_frame,
@@ -450,6 +559,9 @@ class JsonValidator:
                 invalid.append(f"signal_chain:{msg}")
 
             for msg in self._check_next_bar_prediction(obj):
+                invalid.append(msg)
+
+            for msg in self._check_next_cycle_prediction(obj):
                 invalid.append(msg)
 
             for msg in self._check_trade_metrics(obj, decision_stance=decision_stance):
@@ -625,6 +737,71 @@ class JsonValidator:
                 f"K{basis}.low={float(bar.low):.6g}"
             ]
         return []
+
+    @staticmethod
+    def _check_next_cycle_prediction(obj: dict) -> list[str]:
+        """Cross-field validation for next_cycle_prediction.
+
+        Returns error message list; caller adds each to invalid_fields.
+        """
+        from pa_agent.ai.cycle_enums import CYCLE_ENUM, CYCLE_ORDER
+
+        pred = obj.get("next_cycle_prediction")
+        if pred is None:
+            return []  # Missing field is backward-compatible (R5.1)
+        if not isinstance(pred, dict):
+            return ["next_cycle_prediction: must be an object when present"]
+
+        errors: list[str] = []
+        unpredictable = bool(pred.get("unpredictable", False))
+
+        if unpredictable:
+            if pred.get("cycle") is not None:
+                errors.append("next_cycle_prediction.cycle: must be null when unpredictable=true")
+            if pred.get("direction") is not None:
+                errors.append("next_cycle_prediction.direction: must be null when unpredictable=true")
+            if pred.get("probabilities") is not None:
+                errors.append("next_cycle_prediction.probabilities: must be null when unpredictable=true")
+            return errors
+
+        # unpredictable=false path
+        cycle = pred.get("cycle")
+        if cycle not in CYCLE_ENUM:
+            errors.append(
+                f"next_cycle_prediction.cycle: {cycle!r} is not a valid cycle enum value; "
+                f"expected one of {list(CYCLE_ENUM)}"
+            )
+
+        probs = pred.get("probabilities")
+        if not isinstance(probs, dict):
+            return errors + ["next_cycle_prediction.probabilities: must be an object when unpredictable=false"]
+
+        for key in CYCLE_ORDER:
+            value = probs.get(key)
+            if not isinstance(value, int) or not (0 <= value <= 100):
+                errors.append(
+                    f"next_cycle_prediction.probabilities.{key}: must be int in [0, 100]"
+                )
+        if errors:
+            return errors
+
+        # Sum constraint [99, 101]
+        total = sum(probs[k] for k in CYCLE_ORDER)
+        if not (99 <= total <= 101):
+            errors.append(
+                f"next_cycle_prediction.probabilities: sum={total}, must satisfy 99 <= sum <= 101"
+            )
+
+        # cycle = argmax (accept any tied winner)
+        max_value = max(probs[k] for k in CYCLE_ORDER)
+        tied_winners = [k for k in CYCLE_ORDER if probs[k] == max_value]
+        if cycle not in tied_winners:
+            errors.append(
+                f"next_cycle_prediction.cycle: expected one of {tied_winners} "
+                f"(argmax of probabilities), got {cycle!r}"
+            )
+
+        return errors
 
     @staticmethod
     def _check_next_bar_prediction(obj: dict) -> list[str]:

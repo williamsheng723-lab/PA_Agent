@@ -33,7 +33,7 @@ _STYLE_RED = "QProgressBar#tokenProgress::chunk { background-color: #cc0000; }"
 
 
 class _ChatWorker(QThread):
-    finished = pyqtSignal(str, str)
+    finished = pyqtSignal(str, str, float)  # content, reasoning, cache_hit_pct
     error = pyqtSignal(str)
     reasoning_token = pyqtSignal(str)
     content_token = pyqtSignal(str)
@@ -58,7 +58,8 @@ class _ChatWorker(QThread):
                 on_reasoning_token=lambda c: self.reasoning_token.emit(c),
                 on_content_token=lambda c: self.content_token.emit(c),
             )
-            self.finished.emit(reply.content, reply.reasoning_content or "")
+            hit_pct = round(reply.usage.cache_hit_rate * 100, 1) if reply.usage else 0.0
+            self.finished.emit(reply.content, reply.reasoning_content or "", hit_pct)
         except Exception as exc:  # noqa: BLE001
             logger.error("ChatWorker error: %s", exc, exc_info=True)
             self.error.emit(str(exc))
@@ -138,8 +139,13 @@ class AIStreamPanel(QWidget):
         if self._settings is not None:
             point_size = int(getattr(self._settings.general, "stream_pane_font_pt", 11) or 11)
         font = self._mono_font(point_size)
+        # setFont + document().setDefaultFont() ensures the font is applied
+        # immediately to both the widget and its text document layout,
+        # not just on the next content update.
         self._reasoning_edit.setFont(font)
+        self._reasoning_edit.document().setDefaultFont(font)
         self._input_edit.setFont(font)
+        self._input_edit.document().setDefaultFont(font)
 
     def _build_token_bar(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -230,16 +236,28 @@ class AIStreamPanel(QWidget):
                 continue
             reasoning_n = counts.get("reasoning", 0)
             content_n = counts.get("content", 0)
+            cache_hit_pct = counts.get("cache_hit_pct")
             if reasoning_n and content_n:
-                parts.append(f"{label} 思考{reasoning_n:,}+回答{content_n:,}字")
+                text = f"{label} 思考{reasoning_n:,}+回答{content_n:,}字"
             elif reasoning_n:
-                parts.append(f"{label} 思考{reasoning_n:,}字")
+                text = f"{label} 思考{reasoning_n:,}字"
             elif content_n:
-                parts.append(f"{label} 回答{content_n:,}字")
+                text = f"{label} 回答{content_n:,}字"
+            else:
+                continue
+            if cache_hit_pct is not None:
+                text += f"，缓存命中率{cache_hit_pct:.0f}%"
+            parts.append(text)
         if parts:
             self._stats_label.setText(" · ".join(parts))
         else:
             self._stats_label.setText("思考 0 字")
+
+    def set_stage_cache_hit(self, stage: str, cache_hit_pct: float) -> None:
+        """Set the cache hit rate (0–100) for a given stage; refreshes stats label."""
+        counts = self._stage_chars.setdefault(stage, {"reasoning": 0, "content": 0})
+        counts["cache_hit_pct"] = cache_hit_pct
+        self._update_stats()
 
     def _stream_phase_suffix(self) -> str:
         counts = self._stage_chars.get(self._stage, {})
@@ -407,6 +425,7 @@ class AIStreamPanel(QWidget):
         context_window = data.get("context_window", 1_000_000)
         total_input = data.get("total_input", 0)
         total_output = data.get("total_output", 0)
+        total_cached = data.get("total_cached_input", 0)
         pct = (context_used / context_window * 100.0) if context_window > 0 else 0.0
         pct_int = min(100, int(pct))
         self._progress_bar.setValue(pct_int)
@@ -424,9 +443,23 @@ class AIStreamPanel(QWidget):
             self._progress_bar.setStyleSheet(_STYLE_YELLOW)
         else:
             self._progress_bar.setStyleSheet(_STYLE_NORMAL)
+
+        cache_hit_pct = (total_cached / total_input * 100.0) if total_input > 0 else 0.0
+        if total_cached > 0:
+            cache_str = f" · 缓存 {total_cached:,} ({cache_hit_pct:.0f}%)"
+        else:
+            cache_str = ""
+
         self._token_label.setText(
             f"{context_used:,} / {context_window:,} · "
-            f"in {total_input:,} / out {total_output:,}"
+            f"in {total_input:,} / out {total_output:,}{cache_str}"
+        )
+        self._token_label.setToolTip(
+            f"输入 token：{total_input:,}\n"
+            f"  缓存命中：{total_cached:,}（{cache_hit_pct:.1f}%）\n"
+            f"  未命中：{total_input - total_cached:,}\n"
+            f"输出 token：{total_output:,}\n"
+            "DeepSeek KV Cache 命中的 token 按 10% 价格计费。"
         )
 
     def on_stage_prompt_ready(self, stage: str, system: str, user: str) -> None:
@@ -509,13 +542,16 @@ class AIStreamPanel(QWidget):
         self._worker.error.connect(lambda *_: self._on_worker_done())
         self._worker.start()
 
-    def _on_reply_done(self, content: str, reasoning: str) -> None:
+    def _on_reply_done(self, content: str, reasoning: str, cache_hit_pct: float) -> None:
         if reasoning and self._reasoning_chars == 0:
             self._append_reasoning(reasoning)
         chat_counts = self._stage_chars.get("chat", {})
         if content and chat_counts.get("content", 0) == 0:
             self._append_stream_text_for_stage("chat", content, kind="content")
         self._end_stage("追问", stage="chat")
+        # Show per-call cache hit rate on the stats label
+        if cache_hit_pct > 0:
+            self.set_stage_cache_hit("chat", cache_hit_pct)
         if self._session is not None:
             ledger = getattr(self._session, "_ledger", None)
             if ledger is not None and hasattr(ledger, "breakdown"):

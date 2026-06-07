@@ -10,7 +10,7 @@ import pytest
 from pa_agent.data.base import IndicatorBundle, KlineBar, KlineFrame
 from tests.fixtures.gate_trace import make_bar_by_bar_summary, make_mandatory_gate_trace_proceed
 
-SAMPLE_GATE_TRACE = make_mandatory_gate_trace_proceed(max_seq=5)
+SAMPLE_GATE_TRACE = make_mandatory_gate_trace_proceed(max_seq=20)
 
 SAMPLE_DECISION_TRACE = [
     {
@@ -78,7 +78,7 @@ SAMPLE_DECISION_TRACE = [
     },
 ]
 
-SAMPLE_BAR_BY_BAR_SUMMARY = make_bar_by_bar_summary(5)
+SAMPLE_BAR_BY_BAR_SUMMARY = make_bar_by_bar_summary(8)
 
 VALID_STAGE1 = {
     "cycle_position": "normal_channel",
@@ -168,23 +168,29 @@ def make_reply(content_dict: dict) -> MagicMock:
 
 
 def make_frame() -> KlineFrame:
-    """Build a minimal KlineFrame for testing."""
+    """Build a minimal KlineFrame for testing (20 bars, bullish trend to pass PreflightDataGate)."""
+    n = 20
+    # Construct bars with a clear bullish trend: price rises from K20 (oldest) to K1 (newest)
+    # seq=1 is newest (bars[0]), seq=20 is oldest (bars[19])
     bars = tuple(
         KlineBar(
             seq=i + 1,
             ts_open=1000 - i * 60000,
-            open=2000.0,
-            high=2010.0,
-            low=1990.0,
-            close=2005.0,
+            open=2000.0 + (n - 1 - i) * 2.0,   # older bars have lower price
+            high=2010.0 + (n - 1 - i) * 2.0,
+            low=1990.0 + (n - 1 - i) * 2.0,
+            close=2005.0 + (n - 1 - i) * 2.0,   # close rises: K20=close~2005, K1=close~2043
             volume=100.0,
             closed=(i > 0),
         )
-        for i in range(5)
+        for i in range(n)
     )
+    # EMA rising: newer bars (index 0=K1) have higher EMA than older bars
+    ema_values = tuple(2000.0 + (n - 1 - i) * 1.5 for i in range(n))
+    atr_values = tuple([10.0] * n)
     indicators = IndicatorBundle(
-        ema20=tuple([2000.0] * 5),
-        atr14=tuple([10.0] * 5),
+        ema20=ema_values,
+        atr14=atr_values,
     )
     return KlineFrame(
         symbol="XAUUSD",

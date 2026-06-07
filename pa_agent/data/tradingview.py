@@ -23,8 +23,21 @@ from pa_agent.data.tradingview_errors import format_tradingview_fetch_error
 
 logger = logging.getLogger(__name__)
 
-_TV_FETCH_RETRIES = 2
+# One attempt per fetch cycle. Each tvDatafeed get_hist() that times out
+# blocks for up to _TV_WS_TIMEOUT_S, so retrying here multiplies the worst-case
+# wait the user sees on a slow/blocked connection. The RefreshLoop already does
+# its own exponential backoff + retry across ticks, so a per-call retry only
+# stacks latency without adding resilience.
+_TV_FETCH_RETRIES = 1
 _TV_FETCH_RETRY_SLEEP_S = 0.5
+
+# Override tvDatafeed's hardcoded 15s WebSocket timeout. Once the socket leak
+# (see _close_tv_socket) is fixed, healthy fetches complete in 1-3s, so this
+# only bounds the worst case on a stalled connection.
+_TV_WS_TIMEOUT_S = 10.0
+
+# Name-mangled attribute tvDatafeed uses internally for its socket timeout.
+_TV_WS_TIMEOUT_ATTR = "_TvDatafeed__ws_timeout"
 
 # Map our timeframe strings to tvDatafeed Interval enum names
 _TF_MAP: dict[str, str] = {
@@ -98,6 +111,12 @@ class TradingViewSource(DataSource):
                 self._tv = TvDatafeed(self._username, self._password)
             else:
                 self._tv = TvDatafeed()  # anonymous
+            # Bound tvDatafeed's hardcoded 15s WebSocket timeout so a stalled
+            # connection fails faster instead of freezing the UI.
+            try:
+                setattr(self._tv, _TV_WS_TIMEOUT_ATTR, _TV_WS_TIMEOUT_S)
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not override tvDatafeed ws timeout", exc_info=True)
             self._connected = True
             logger.info("TradingViewSource connected (anonymous=%s)", not self._username)
         except Exception as exc:
@@ -108,9 +127,40 @@ class TradingViewSource(DataSource):
             ) from exc
 
     def disconnect(self) -> None:
+        self._close_tv_socket()
         self._tv = None
         self._connected = False
         logger.info("TradingViewSource disconnected")
+
+    def _close_tv_socket(self) -> None:
+        """Close the live tvDatafeed WebSocket, if any.
+
+        tvDatafeed 2.x opens a brand-new socket on *every* ``get_hist()`` call
+        and never closes the previous one — a leak that piles up half-open
+        connections and trips TradingView's rate limiting. Closing the socket
+        after each fetch fixes the leak, and closing it mid-flight is also the
+        only way to abort a ``recv()`` that is blocked waiting on a stalled
+        connection (e.g. when the user switches symbol/timeframe).
+
+        Safe to call from another thread: ``socket.close()`` will raise inside
+        the blocked ``recv()``, which tvDatafeed catches and turns into an
+        empty result.
+        """
+        tv = self._tv
+        if tv is None:
+            return
+        ws = getattr(tv, "ws", None)
+        if ws is None:
+            return
+        try:
+            ws.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("tvDatafeed socket close failed", exc_info=True)
+        finally:
+            try:
+                tv.ws = None
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
@@ -138,6 +188,11 @@ class TradingViewSource(DataSource):
             raise ValueError(f"Unsupported timeframe: {timeframe!r}. Use one of {list(_TF_MAP)}")
         self._timeframe = timeframe
         self._symbol = symbol.strip()
+        # Abort any in-flight get_hist() blocked on a stalled connection so the
+        # new symbol/timeframe takes effect immediately instead of waiting out
+        # the previous request's timeout. Closing the socket raises inside the
+        # worker thread's recv(); the next fetch transparently reconnects.
+        self._close_tv_socket()
         logger.info(
             "TradingViewSource subscribed: %s %s exchange=%s",
             self._symbol,
@@ -189,6 +244,11 @@ class TradingViewSource(DataSource):
                     _TV_FETCH_RETRIES,
                     exc,
                 )
+            finally:
+                # tvDatafeed leaks the WebSocket it opens on every get_hist()
+                # call. Close it here so half-open sockets don't accumulate and
+                # trip TradingView rate limiting; the next call reconnects.
+                self._close_tv_socket()
             if attempt < _TV_FETCH_RETRIES:
                 time.sleep(_TV_FETCH_RETRY_SLEEP_S)
         if last_exc is not None:

@@ -120,8 +120,11 @@ def test_stage2_user_prompt_includes_gate_trace(assembler: PromptAssembler):
     }
     messages = assembler.build_stage2(frame, stage1_json, [], [])
     user = messages[1]["content"]
-    assert "gate_result=proceed" in user
+    # gate_trace and gate_result are embedded inside the compact stage1 JSON block
+    assert "gate_result" in user
     assert "gate_trace" in user or "0.1" in user
+    # The redundant separate gate_block section should no longer exist
+    assert "## 阶段一闸门路径" not in user
 
 
 def test_stage2_system_prompt_order(assembler: PromptAssembler):

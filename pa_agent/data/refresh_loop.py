@@ -74,6 +74,9 @@ class RefreshLoop(QThread):
                     bars = self._source.latest_snapshot(
                         self._n_bars + INDICATOR_WARMUP_BARS + 5
                     )
+                    if self._consecutive_failures > 0:
+                        # Clear any previous error message from the status bar.
+                        self.status_changed.emit("")
                     self._consecutive_failures = 0
                     failure_start = None
                     if bars:

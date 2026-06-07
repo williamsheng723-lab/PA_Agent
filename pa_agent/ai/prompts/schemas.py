@@ -1,6 +1,23 @@
 """JSON schemas for Stage 1 and Stage 2 AI outputs."""
 from __future__ import annotations
 
+# ── Override item schema ──────────────────────────────────────────────────────
+
+_NODE_OVERRIDE_ITEM: dict = {
+    "type": "object",
+    "required": ["node_id", "answer", "override_reason"],
+    "properties": {
+        "node_id": {"type": "string"},
+        "answer": {
+            "type": "string",
+            "enum": ["是", "否", "中性", "等待", "不适用"],
+        },
+        "branch": {"type": ["string", "null"]},
+        "override_reason": {"type": "string", "minLength": 1},
+    },
+    "additionalProperties": True,
+}
+
 # ── Shared trace item schemas (二元决策树) ─────────────────────────────────────
 
 _TRACE_ITEM: dict = {
@@ -33,6 +50,11 @@ _TRACE_ITEM: dict = {
             "minimum": 1,
             "description": "Newer bar seq (smaller, often 1)",
         },
+        # Override trace fields (optional, present when overridden_by_ai=True)
+        "program_answer": {"type": "string"},
+        "program_branch": {"type": ["string", "null"]},
+        "override_reason": {"type": "string"},
+        "overridden_by_ai": {"type": "boolean"},
     },
     "additionalProperties": True,
 }
@@ -127,6 +149,7 @@ _BAR_BY_BAR_ITEM: dict = {
                 "structure", "signal", "entry", "confirmation",
                 "noise", "trap", "climax", "test",
                 "trend_bull", "trend_bear",
+                "trapped_traders",
             ],
         },
         "bar_type": {
@@ -141,6 +164,7 @@ _BAR_BY_BAR_ITEM: dict = {
             "enum": [
                 "strengthens_bull", "weakens_bull", "strengthens_bear",
                 "weakens_bear", "neutral", "transition",
+                "weakened_bull", "weakened_bear",
             ],
         },
         "follow_through": {"type": "string", "enum": ["yes", "no", "pending", "failed"]},
@@ -225,6 +249,10 @@ STAGE1_SCHEMA: dict = {
             },
             "additionalProperties": True,
         },
+        "node_overrides": {
+            "type": "array",
+            "items": _NODE_OVERRIDE_ITEM,
+        },
     },
     "allOf": [
         # spike only requires spike_stage (micro_channel may keep spike_stage null)
@@ -293,7 +321,7 @@ _DECISION_BASE: dict = {
         "trade_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
         "trade_confidence_reasoning": {"type": "string"},
         "estimated_win_rate": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
-        "estimated_win_rate_reasoning": {"type": "string"},
+        "estimated_win_rate_reasoning": {"type": ["string", "null"]},
         "key_factors": {"type": "array", "items": {"type": "string"}},
         "watch_points": {"type": "array", "items": {"type": "string"}},
         "risk_assessment": {"type": "string"},
@@ -397,6 +425,7 @@ _NEXT_BAR_PREDICTION: dict = {
                     "analysis_history",
                     "experience_library",
                     "stage2_decision",
+                    "previous_prediction_summary",
                 ],
             },
             "uniqueItems": True,
@@ -433,8 +462,81 @@ _NEXT_BAR_PREDICTION: dict = {
     "additionalProperties": False,
 }
 
+# ── Next cycle prediction sub-schemas ────────────────────────────────────────
+
+from pa_agent.ai.cycle_enums import CYCLE_ENUM as _CYCLE_ENUM  # noqa: E402
+
+_NEXT_CYCLE_PROBABILITIES: dict = {
+    "type": ["object", "null"],
+    "required": list(_CYCLE_ENUM),
+    "properties": {k: {"type": "integer", "minimum": 0, "maximum": 100} for k in _CYCLE_ENUM},
+    "additionalProperties": False,
+}
+
+_NEXT_CYCLE_PREDICTION: dict = {
+    "type": "object",
+    "required": ["cycle", "direction", "probabilities", "reasoning", "unpredictable", "features_used"],
+    "properties": {
+        "cycle": {
+            "type": ["string", "null"],
+            "enum": list(_CYCLE_ENUM) + [None],
+        },
+        "direction": {
+            "type": ["string", "null"],
+            "enum": ["bullish", "bearish", "neutral", None],
+        },
+        "probabilities": _NEXT_CYCLE_PROBABILITIES,
+        "reasoning": {"type": "string", "minLength": 1, "maxLength": 1500},
+        "unpredictable": {"type": "boolean"},
+        "features_used": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "stage1_diagnosis",
+                    "kline_features",
+                    "analysis_history",
+                    "experience_library",
+                    "stage2_decision",
+                    "previous_prediction_summary",
+                ],
+            },
+            "uniqueItems": True,
+        },
+    },
+    "allOf": [
+        # unpredictable=false → cycle must be non-null enum string, probabilities must be object
+        {
+            "if": {
+                "properties": {"unpredictable": {"const": False}},
+                "required": ["unpredictable"],
+            },
+            "then": {
+                "properties": {
+                    "cycle": {"type": "string", "enum": list(_CYCLE_ENUM)},
+                    "probabilities": {"type": "object"},
+                },
+            },
+        },
+        # unpredictable=true → cycle=null, direction=null, probabilities=null
+        {
+            "if": {
+                "properties": {"unpredictable": {"const": True}},
+                "required": ["unpredictable"],
+            },
+            "then": {
+                "properties": {
+                    "cycle": {"type": "null"},
+                    "direction": {"type": "null"},
+                    "probabilities": {"type": "null"},
+                },
+            },
+        },
+    ],
+    "additionalProperties": False,
+}
+
 STAGE2_SCHEMA: dict = {
-    "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
     "required": ["decision", "diagnosis_summary", "decision_trace", "terminal"],
     "properties": {
@@ -456,6 +558,11 @@ STAGE2_SCHEMA: dict = {
         "bar_analysis": _BAR_ANALYSIS,
         "gate_shortcircuited": {"type": "boolean"},
         "next_bar_prediction": _NEXT_BAR_PREDICTION,
+        "next_cycle_prediction": _NEXT_CYCLE_PREDICTION,
+        "node_overrides": {
+            "type": "array",
+            "items": _NODE_OVERRIDE_ITEM,
+        },
     },
     "additionalProperties": True,
 }

@@ -30,22 +30,23 @@ from tests.fixtures.ai_payloads import VALID_STAGE1, VALID_STAGE2
 
 
 def _make_frame() -> KlineFrame:
+    n = 20
     bars = tuple(
         KlineBar(
             seq=i + 1,
             ts_open=1_700_000_000_000 - i * 3_600_000,
-            open=2000.0,
-            high=2010.0,
-            low=1990.0,
-            close=2005.0,
+            open=2000.0 + (n - 1 - i) * 2.0,
+            high=2010.0 + (n - 1 - i) * 2.0,
+            low=1990.0 + (n - 1 - i) * 2.0,
+            close=2005.0 + (n - 1 - i) * 2.0,
             volume=100.0,
             closed=(i > 0),
         )
-        for i in range(5)
+        for i in range(n)
     )
     indicators = IndicatorBundle(
-        ema20=tuple([2000.0] * 5),
-        atr14=tuple([10.0] * 5),
+        ema20=tuple(2000.0 + (n - 1 - i) * 1.5 for i in range(n)),
+        atr14=tuple([10.0] * n),
     )
     return KlineFrame(
         symbol="XAUUSD",

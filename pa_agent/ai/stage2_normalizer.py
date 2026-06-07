@@ -38,14 +38,40 @@ def _trace_node_answer(trace: Any, node_id: str) -> str | None:
 
 
 def _section14_violated(trace: Any) -> bool:
+    """Return True only when §14 answer is 是 AND the reason text confirms a violation.
+
+    Background: §14 question is "是否触犯禁止行为清单？"
+      answer=是  → violated (程序强制 order_type=不下单)
+      answer=否  → not violated (can proceed)
+
+    Some models incorrectly write answer=是 to mean "I completed the scan (no violations)".
+    To guard against this common mistake we cross-check the reason text: if it contains
+    explicit denial phrases (未触犯 / 未违反 / 无触犯 / 通过) we do NOT treat it as a
+    violation.  This is a safety hatch — the prompt now clearly specifies answer=否 for
+    the no-violation case, so future outputs should be correct.
+    """
+    _DENIAL_PHRASES = ("未触犯", "未违反", "无触犯", "无违规", "通过扫描", "扫描通过", "无禁止", "未触发")
     if not isinstance(trace, list):
         return False
     for item in trace:
         if not isinstance(item, dict):
             continue
         nid = str(item.get("node_id", "")).strip()
-        if nid.startswith("14") and str(item.get("answer", "")).strip() == "是":
-            return True
+        if not nid.startswith("14"):
+            continue
+        if str(item.get("answer", "")).strip() != "是":
+            continue
+        # answer=是: check reason for denial phrases before treating as violation
+        reason = str(item.get("reason", "") or "")
+        if any(phrase in reason for phrase in _DENIAL_PHRASES):
+            # AI wrote answer=是 but reason says no violation — ignore (AI used wrong answer)
+            logger.debug(
+                "_section14_violated: node %s answer=是 but reason contains denial phrase; "
+                "treating as NOT violated (AI should use answer=否 for no-violation)",
+                nid,
+            )
+            continue
+        return True
     return False
 
 
@@ -190,6 +216,95 @@ def _coerce_decision_when_trade_metrics_fail(
     return True
 
 
+def _normalize_next_cycle_prediction(prediction: dict[str, Any]) -> None:
+    """In-place normalize next_cycle_prediction common model quirks. Idempotent."""
+    from pa_agent.ai.cycle_enums import CYCLE_ORDER
+
+    if not isinstance(prediction, dict):
+        return
+
+    # 1. unpredictable fallback
+    unpredictable = bool(prediction.get("unpredictable", False))
+    prediction["unpredictable"] = unpredictable
+
+    # 2. features_used: ensure list, dedup, minimum set
+    feats = prediction.get("features_used")
+    if not isinstance(feats, list):
+        feats = []
+    feats = [f for f in feats if isinstance(f, str)]
+    if "stage1_diagnosis" not in feats:
+        feats.insert(0, "stage1_diagnosis")
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for f in feats:
+        if f not in seen:
+            deduped.append(f)
+            seen.add(f)
+    prediction["features_used"] = deduped
+
+    # 3. reasoning truncation
+    reasoning = prediction.get("reasoning")
+    if isinstance(reasoning, str) and len(reasoning) > 1500:
+        prediction["reasoning"] = reasoning[:1499] + "…"
+    elif not isinstance(reasoning, str):
+        prediction["reasoning"] = ""
+
+    if unpredictable:
+        # unpredictable → force cycle / direction / probabilities = null
+        prediction["cycle"] = None
+        prediction["direction"] = None
+        prediction["probabilities"] = None
+        return
+
+    # 4. probabilities integer rounding, clamping, and sum normalization
+    probs = prediction.get("probabilities")
+    if isinstance(probs, dict):
+        normalized: dict[str, int] = {}
+        for key in CYCLE_ORDER:
+            raw = probs.get(key)
+            try:
+                value = int(round(float(raw))) if raw is not None else 0
+            except (TypeError, ValueError):
+                value = 0
+            normalized[key] = max(0, min(100, value))
+
+        # Auto-rescale if sum is outside [99, 101] (model arithmetic error)
+        total = sum(normalized[k] for k in CYCLE_ORDER)
+        if total > 0 and not (99 <= total <= 101):
+            scale = 100.0 / total
+            rescaled = {k: int(round(normalized[k] * scale)) for k in CYCLE_ORDER}
+            # Fix rounding residual so sum == 100
+            diff = 100 - sum(rescaled[k] for k in CYCLE_ORDER)
+            if diff != 0:
+                # Add/subtract from the largest bucket
+                biggest = max(CYCLE_ORDER, key=lambda k: rescaled[k])
+                rescaled[biggest] = max(0, rescaled[biggest] + diff)
+            normalized = rescaled
+            logger.debug(
+                "next_cycle_prediction probabilities rescaled (sum was %d -> 100)", total
+            )
+
+        prediction["probabilities"] = normalized
+
+        # 5. cycle = argmax, tie-break by CYCLE_ORDER literal order
+        max_value = max(normalized[k] for k in CYCLE_ORDER)
+        # First winner in CYCLE_ORDER order
+        argmax_cycle = next(k for k in CYCLE_ORDER if normalized[k] == max_value)
+
+        model_cycle = str(prediction.get("cycle") or "").strip().lower()
+        if model_cycle != argmax_cycle:
+            logger.debug(
+                "next_cycle_prediction cycle %r -> %r (argmax of %s)",
+                model_cycle, argmax_cycle, normalized,
+            )
+            prediction["cycle"] = argmax_cycle
+
+    # direction: keep model value; only type-coerce non-string to None
+    direction = prediction.get("direction")
+    if direction is not None and not isinstance(direction, str):
+        prediction["direction"] = None
+
+
 def _normalize_next_bar_prediction(prediction: dict[str, Any]) -> None:
     """In-place normalize next_bar_prediction common model quirks. Idempotent."""
     if not isinstance(prediction, dict):
@@ -231,13 +346,29 @@ def _normalize_next_bar_prediction(prediction: dict[str, Any]) -> None:
     probs = prediction.get("probabilities")
     if isinstance(probs, dict):
         normalized: dict[str, int] = {}
-        for key in ("bullish", "bearish", "neutral"):
+        bar_order = ("bullish", "bearish", "neutral")
+        for key in bar_order:
             raw = probs.get(key)
             try:
                 value = int(round(float(raw))) if raw is not None else 0
             except (TypeError, ValueError):
                 value = 0
             normalized[key] = max(0, min(100, value))
+
+        # Auto-rescale if sum is outside [99, 101] (model arithmetic error)
+        total = sum(normalized[k] for k in bar_order)
+        if total > 0 and not (99 <= total <= 101):
+            scale = 100.0 / total
+            rescaled = {k: int(round(normalized[k] * scale)) for k in bar_order}
+            diff = 100 - sum(rescaled[k] for k in bar_order)
+            if diff != 0:
+                biggest = max(bar_order, key=lambda k: rescaled[k])
+                rescaled[biggest] = max(0, rescaled[biggest] + diff)
+            normalized = rescaled
+            logger.debug(
+                "next_bar_prediction probabilities rescaled (sum was %d -> 100)", total
+            )
+
         prediction["probabilities"] = normalized
 
         # 5. direction = argmax (R3.3) — respect model choice on ties
@@ -285,6 +416,7 @@ def normalize_stage2(
     normalization_mode: str = "strict",
     kline_frame: Any = None,
     decision_stance: str | None = None,
+    stage1_json: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a copy of *obj* with decision_trace quirks corrected."""
     out = copy.deepcopy(obj)
@@ -305,6 +437,15 @@ def normalize_stage2(
             decision.get("entry_basis_bar"),
         )
     _coerce_decision_when_trade_metrics_fail(out, decision_stance=decision_stance)
+
+    # ── DecisionNodeEngine: fill §9.1/§9.2/§9.3/§9.5/§11 ─────────────────────
+    if kline_frame is not None:
+        try:
+            from pa_agent.ai.decision_nodes import DecisionNodeEngine
+            DecisionNodeEngine.apply_stage2(out, kline_frame, stage1_json)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DecisionNodeEngine.apply_stage2 failed: %s", exc)
+
     normalize_stage2_traces(
         out,
         normalization_mode=normalization_mode,
@@ -347,5 +488,10 @@ def normalize_stage2(
     pred = out.get("next_bar_prediction")
     if isinstance(pred, dict):
         _normalize_next_bar_prediction(pred)
+
+    # Next cycle prediction normalization (only when field exists)
+    pred_c = out.get("next_cycle_prediction")
+    if isinstance(pred_c, dict):
+        _normalize_next_cycle_prediction(pred_c)
 
     return out

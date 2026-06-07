@@ -230,7 +230,7 @@ def _incremental_summary_from_risk_warning(risk_warning: str) -> str | None:
         idx = text.find(marker)
         if idx >= 0:
             chunk = text[idx:].split("。", 1)[0].strip()
-            if len(chunk) >= 16:
+            if len(chunk) >= 1:
                 return chunk + ("。" if not chunk.endswith("。") else "")
     return None
 
@@ -260,7 +260,7 @@ def _fill_incremental_delta(
         )
 
     summary = str(delta.get("summary", "") or "").strip()
-    if len(summary) < 16:
+    if len(summary) < 1:
         from_rw = _incremental_summary_from_risk_warning(
             str(out.get("risk_warning", "") or "")
         )
@@ -295,7 +295,30 @@ def normalize_stage1(
 ) -> dict[str, Any]:
     """Return a copy of *obj* with known AI quirks corrected."""
     out = copy.deepcopy(obj)
+
+    # ── Unwrap nested wrapper: {"meta": {...}, "stage1_diagnosis": { <actual> }} ──
+    # Models occasionally wrap the diagnosis inside a "stage1_diagnosis" key,
+    # or include extra top-level metadata fields alongside the diagnosis.
+    if "stage1_diagnosis" in out and isinstance(out["stage1_diagnosis"], dict):
+        inner = out["stage1_diagnosis"]
+        # Only unwrap if the inner dict has core diagnosis fields and the outer doesn't
+        if "cycle_position" in inner and "cycle_position" not in out:
+            # Merge inner into out, preserving any incremental_delta that may be at top level
+            delta_top = out.get("incremental_delta")
+            out = inner
+            if delta_top is not None and "incremental_delta" not in out:
+                out["incremental_delta"] = delta_top
+            logger.debug("Unwrapped stage1_diagnosis nested wrapper")
+
     lenient = normalization_mode == "lenient"
+
+    # ── DecisionNodeEngine: fill §1.1/§2.3/§2.4 (before strategy_files routing) ──
+    if kline_frame is not None:
+        try:
+            from pa_agent.ai.decision_nodes import DecisionNodeEngine
+            DecisionNodeEngine.apply_stage1(out, kline_frame)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DecisionNodeEngine.apply_stage1 failed: %s", exc)
 
     if "strategy_files_needed" not in out or out.get("strategy_files_needed") is None:
         alt = out.pop("recommended_strategy_files", None)

@@ -38,3 +38,4 @@ class OrchestratorEvent(Enum):
     Stage2Failed = auto()
     RecordSaved = auto()
     Cancelled = auto()
+    InsufficientData = auto()

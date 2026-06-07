@@ -498,21 +498,27 @@ def normalize_trace_item(
     nid = str(item.get("node_id", ""))
 
     ans = str(item.get("answer", "")).strip()
-    if ans and lenient:
+    if ans:
         resolved = _resolve_trace_answer(nid, ans)
         if resolved is not None:
             new_ans, branch = resolved
-            if new_ans != ans:
-                logger.debug(
-                    "trace answer %r -> %r (node %s branch=%s)",
-                    ans,
-                    new_ans,
-                    nid,
-                    branch,
-                )
-            item["answer"] = new_ans
-            if branch:
-                item.setdefault("branch", branch)
+            # In strict mode, only apply node-specific deterministic aliases
+            # (e.g. "路径B" → "是" for node 3.5). Generic fuzzy synonyms
+            # (e.g. "部分" → "中性") are gated by lenient mode because they
+            # involve interpretive judgement.
+            node_specific = bool(_NODE_ANSWER_BY_ID.get(nid))
+            if lenient or node_specific:
+                if new_ans != ans:
+                    logger.debug(
+                        "trace answer %r -> %r (node %s branch=%s)",
+                        ans,
+                        new_ans,
+                        nid,
+                        branch,
+                    )
+                item["answer"] = new_ans
+                if branch:
+                    item.setdefault("branch", branch)
 
     bar_from = item.get("bar_from")
     bar_to = item.get("bar_to")

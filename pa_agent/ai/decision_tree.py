@@ -30,6 +30,27 @@ TERMINAL_OUTCOMES = frozenset({"wait", "reject", "trade", "proceed"})
 # 阶段一禁止当作闸门的节点（原则/执行层，非诊断闸门）
 STAGE1_FORBIDDEN_GATE_NODES = frozenset({"0.3"})
 
+
+def _gate_trace_sort_key(node_id: str) -> tuple[int, int, str]:
+    """Numeric sort key for gate_trace node_id values used by the ordering validator.
+
+    Converts '1.1' -> (1, 1, '1.1'), '2.3' -> (2, 3, '2.3') so that chapter-
+    section pairs sort in natural document order.  Non-numeric suffixes fall
+    back to string comparison in the third component.
+    """
+    parts = str(node_id or "").split(".", 1)
+    try:
+        major = int(parts[0])
+    except (ValueError, IndexError):
+        return (999, 999, node_id)
+    if len(parts) == 1:
+        return (major, 0, node_id)
+    sub = parts[1]
+    try:
+        return (major, int(sub), node_id)
+    except ValueError:
+        return (major, 999, node_id)
+
 def _node_sort_key(node_id: str) -> tuple[int, str]:
     """Sort key for decision_trace ordering checks."""
     prefixes = (
@@ -245,6 +266,8 @@ _BRANCH_DISPLAY_ZH = {
     "path_a": "路径A",
     "path_b": "路径B",
     "path_c": "路径C",
+    "AIL": "Always In 多头",
+    "AIS": "Always In 空头",
 }
 
 
@@ -460,6 +483,24 @@ def validate_gate_result_consistency(stage1: dict[str, Any]) -> list[str]:
                 "gate_result wait/unknown should end with answer 否 or 等待 on last gate node"
             )
 
+    # Check node_id ordering: gate_trace must be in ascending chapter-section order.
+    # merge_program_nodes now sorts injected nodes, but validate here to catch any
+    # future regression or manually constructed traces with wrong ordering.
+    node_ids = [
+        str(item.get("node_id", ""))
+        for item in trace
+        if isinstance(item, dict) and item.get("node_id")
+    ]
+    for idx in range(1, len(node_ids)):
+        prev_key = _gate_trace_sort_key(node_ids[idx - 1])
+        curr_key = _gate_trace_sort_key(node_ids[idx])
+        if curr_key < prev_key:
+            errors.append(
+                f"gate_trace node ordering error: {node_ids[idx - 1]} "
+                f"should come before {node_ids[idx]} "
+                f"(章节顺序错乱，程序节点注入后未正确排序)"
+            )
+
     return errors
 
 
@@ -539,6 +580,44 @@ def validate_stage2_trace_consistency(stage2: dict[str, Any]) -> list[str]:
             errors.append(
                 "when 10.3 answer is 否, terminal.node_id should be 10.3"
             )
+
+        # Detect the "no entry plan → terminal=reject" anti-pattern.
+        # When §9.0 answer is 否/等待 (no valid signal bar) or §10.1 answer is 否
+        # (no stop-loss anchor), there is no trade plan to evaluate.
+        # In that case outcome="reject" is semantically wrong (you can't reject a
+        # plan that never existed) — outcome must be "wait".
+        #
+        # Exception: if §14 is genuinely violated (answer=是 AND reason does NOT
+        # contain denial phrases), outcome="reject" is correct because the
+        # prohibition explicitly terminated the analysis.  §14 is a stronger
+        # stop reason than §9.0=否 and takes semantic precedence.
+        idx_90 = _index_of(node_ids, "9.0")
+        idx_101 = _index_of(node_ids, "10.1")
+        no_entry_plan = False
+        if idx_90 >= 0:
+            ans_90 = str(trace[idx_90].get("answer", "") or "").strip()
+            if ans_90 in ("否", "等待"):
+                no_entry_plan = True
+        if not no_entry_plan and idx_101 >= 0:
+            ans_101 = str(trace[idx_101].get("answer", "") or "").strip()
+            if ans_101 == "否":
+                no_entry_plan = True
+        if no_entry_plan and outcome == "reject":
+            # Check if §14 genuinely triggered (true violation, not AI misuse)
+            _DENIAL = ("未触犯", "未违反", "无触犯", "无违规", "通过扫描", "扫描通过", "无禁止", "未触发")
+            sec14_genuinely_violated = any(
+                str(item.get("node_id", "")).strip().startswith("14")
+                and str(item.get("answer", "")).strip() == "是"
+                and not any(p in str(item.get("reason", "") or "") for p in _DENIAL)
+                for item in trace
+                if isinstance(item, dict)
+            )
+            if not sec14_genuinely_violated:
+                errors.append(
+                    "terminal.outcome should be 'wait' (not 'reject') when there is no "
+                    "entry plan to evaluate: §9.0=否/等待 or §10.1=否 means no trade "
+                    "scheme existed, so nothing can be 'rejected' by the trader equation"
+                )
 
     # 整体章节顺序：已评估节点的 rank 应非递减
     ranks = [_node_sort_key(n)[0] for n in node_ids if not n.startswith("0.")]

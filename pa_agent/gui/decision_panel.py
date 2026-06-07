@@ -126,7 +126,7 @@ def _format_prediction_probs_line(probs: dict) -> str:
     bull = probs.get("bullish", "?")
     bear = probs.get("bearish", "?")
     neut = probs.get("neutral", "?")
-    return f"阳 {bull}%  ·  阴 {bear}%  ·  中 {neut}%"
+    return f"阳线的概率为{bull}%  ·  阴线的概率为{bear}%  ·  中性的概率为{neut}%"
 
 
 def _dominant_prediction_direction(probs: dict) -> str | None:
@@ -323,46 +323,10 @@ class DecisionPanel(QWidget):
         self._reasoning_edit.setObjectName("answerPane")
         self._reasoning_edit.setStyleSheet(_REASON_EDIT_CSS)
         self._reasoning_edit.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self._reasoning_edit.setMinimumHeight(80)
-        self._reasoning_edit.setMaximumHeight(200)
-        layout.addWidget(self._reasoning_edit)
-
-        # ── 下一根K线预期 (R6) ─────────────────────────────────────────────
-        self._prediction_group = QFrame()
-        self._prediction_group.setObjectName("predictionGroup")
-        pred_layout = QVBoxLayout(self._prediction_group)
-        pred_layout.setContentsMargins(0, 8, 0, 0)
-        pred_layout.setSpacing(6)
-
-        self._prediction_title = QLabel("下一根K线预期")
-        self._prediction_title.setStyleSheet("font-weight: bold; color: #79c0ff;")
-        pred_layout.addWidget(self._prediction_title)
-
-        self._prediction_direction_label = QLabel("—")
-        self._prediction_direction_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._prediction_direction_label.setWordWrap(True)
-        self._prediction_direction_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; padding: 8px;"
-            "background-color: #21262d; border-radius: 6px; color: #8b949e;"
-        )
-        pred_layout.addWidget(self._prediction_direction_label)
-
-        self._prediction_reasoning_edit = QTextEdit()
-        self._prediction_reasoning_edit.setReadOnly(True)
-        self._prediction_reasoning_edit.setObjectName("answerPane")
-        self._prediction_reasoning_edit.setStyleSheet(_REASON_EDIT_CSS)
-        self._prediction_reasoning_edit.setMaximumHeight(120)
-        self._prediction_reasoning_edit.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
-        )
-        pred_layout.addWidget(self._prediction_reasoning_edit)
-
-        self._prediction_group.setVisible(False)
-        layout.addWidget(self._prediction_group)
-
-        layout.addStretch(1)
+        self._reasoning_edit.setMinimumHeight(120)
+        layout.addWidget(self._reasoning_edit, stretch=1)
 
         self.clear()
 
@@ -492,42 +456,6 @@ class DecisionPanel(QWidget):
         self._rr_inline_label.setVisible(False)
         self._win_rate_inline_label.setVisible(False)
 
-    def _apply_next_bar_prediction(self, decision: dict) -> None:
-        """Render next_bar_prediction group (R6). Silently hides on missing/invalid."""
-        pred = decision.get("next_bar_prediction")
-        if not isinstance(pred, dict):
-            self._prediction_group.setVisible(False)
-            self._prediction_direction_label.setText("—")
-            self._prediction_reasoning_edit.clear()
-            return
-
-        unpredictable = bool(pred.get("unpredictable", False))
-        if unpredictable:
-            line = _PREDICTION_UNPREDICTABLE_LABEL
-            color = _PREDICTION_UNPREDICTABLE_COLOR
-        else:
-            probs = pred.get("probabilities")
-            if isinstance(probs, dict):
-                line = _format_prediction_probs_line(probs)
-                dominant = _dominant_prediction_direction(probs)
-                color = _PREDICTION_DOMINANT_COLOR.get(
-                    dominant, _PREDICTION_UNPREDICTABLE_COLOR
-                )
-            else:
-                line = "—"
-                color = _PREDICTION_UNPREDICTABLE_COLOR
-
-        self._prediction_direction_label.setText(line)
-        self._prediction_direction_label.setStyleSheet(
-            f"font-size: 16px; font-weight: bold; padding: 8px;"
-            f"background-color: #21262d; border-radius: 6px;"
-            f"color: {color};"
-        )
-
-        reasoning = str(pred.get("reasoning", "")).strip()
-        self._prediction_reasoning_edit.setPlainText(reasoning)
-        self._prediction_group.setVisible(True)
-
     # ── Public API ────────────────────────────────────────────────────────
 
     def set_decision(
@@ -634,7 +562,6 @@ class DecisionPanel(QWidget):
             )
 
         self._reasoning_edit.setPlainText(str(reasoning) if reasoning else "")
-        self._apply_next_bar_prediction(decision)
 
     def clear(self) -> None:
         self._trend_label.setText("趋势：—")
@@ -662,9 +589,5 @@ class DecisionPanel(QWidget):
         self._trade_prices_row.setVisible(False)
         self._trade_conf_inline_label.setVisible(False)
         self._trade_reasoning_label.setVisible(False)
-
-        self._prediction_group.setVisible(False)
-        self._prediction_direction_label.setText("—")
-        self._prediction_reasoning_edit.clear()
 
         self._reasoning_edit.clear()

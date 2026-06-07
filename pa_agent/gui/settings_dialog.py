@@ -122,6 +122,12 @@ class SettingsDialog(QDialog):
         )
         general_form.addRow("图表:", self._auto_resume_chart_check)
 
+        self._keep_analysis_check = QCheckBox("有新K线收盘时自动开始新一轮分析")
+        self._keep_analysis_check.setToolTip(
+            "勾选后，每当有新的K线收盘时自动触发分析（与主界面「持续跟踪分析」勾选框同步）"
+        )
+        general_form.addRow("持续跟踪分析:", self._keep_analysis_check)
+
         self._context_warning_spin = QSpinBox()
         self._context_warning_spin.setRange(1, 100)
         self._context_warning_spin.setSuffix(" %")
@@ -226,6 +232,9 @@ class SettingsDialog(QDialog):
         self._auto_resume_chart_check.setChecked(
             bool(getattr(g, "auto_resume_chart_after_analysis", False))
         )
+        self._keep_analysis_check.setChecked(
+            bool(getattr(g, "keep_analysis", False))
+        )
         self._context_warning_spin.setValue(int(g.context_warning_threshold_pct))
         self._stream_font_spin.setValue(int(getattr(g, "stream_pane_font_pt", 11)))
         self._chart_seq_font_spin.setValue(int(getattr(g, "chart_seq_label_font_pt", 7)))
@@ -290,6 +299,7 @@ class SettingsDialog(QDialog):
         g.analysis_bar_count = self._analysis_bar_count_spin.value()
         g.refresh_interval_ms = self._refresh_interval_spin.value()
         g.auto_resume_chart_after_analysis = self._auto_resume_chart_check.isChecked()
+        g.keep_analysis = self._keep_analysis_check.isChecked()
         g.context_warning_threshold_pct = float(self._context_warning_spin.value())
         g.stream_pane_font_pt = self._stream_font_spin.value()
         g.chart_seq_label_font_pt = self._chart_seq_font_spin.value()

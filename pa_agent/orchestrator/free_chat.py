@@ -105,6 +105,12 @@ class FreeChatSession:
         # Derived record ID used as the JSONL sidecar basename.
         self._record_id: str = _derive_record_id(base_record)
 
+        # ── Pre-build stable prefix (cached for all turns in this session) ────
+        # These three messages are byte-for-byte identical across every turn of
+        # the same session, so they form a stable prefix that the API can cache.
+        # Building them once at session start avoids repeated JSON serialisation.
+        self._cached_prefix: list[dict] = self._build_prefix(base_record)
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     @property
@@ -116,6 +122,137 @@ class FreeChatSession:
     def record_id(self) -> str:
         """The record basename used for the JSONL sidecar file."""
         return self._record_id
+
+    @staticmethod
+    def _build_prefix(base_record: AnalysisRecord) -> list[dict]:
+        """Build the stable prefix messages for this session (built once, reused each turn).
+
+        Structure:
+          [0] system  — follow-up advisor instructions (fully static across sessions)
+          [1] user    — compact analysis reference (static within this session;
+                        meta timestamps removed so the block stays stable)
+          [2] assistant — Stage 2 original AI reply (static within this session;
+                        lets the model see its own prose, not just the parsed JSON)
+
+        Keeping these byte-identical across all turns of the same session means
+        the API prefix cache is warm from turn 2 onwards, cutting prompt token
+        cost significantly for multi-turn follow-up conversations.
+        """
+        prefix: list[dict] = []
+
+        # [0] System — completely static, shared across all sessions
+        prefix.append(
+            {
+                "role": "system",
+                "content": (
+                    "你是 PA Agent 的【追问助手】（post-analysis advisor），不是在执行新的完整两阶段分析。\n"
+                    "你的目标是：优先、直接回答用户当前问题；必要时引用价格行为/关键价位/风险控制。\n"
+                    "\n"
+                    "严格规则：\n"
+                    "1) 默认用自然语言回答；除非用户明确要求 JSON/决策树，否则不要输出二元决策树 JSON。\n"
+                    "2) 如果用户问的是【已有仓位管理】（止损/止盈/减仓/持有/加仓）：\n"
+                    "   - 只围绕持仓管理回答，不要重新跑完整下单决策。\n"
+                    "   - 先给结论（可以/不建议/条件允许），再给依据（结构/关键位/信号），再给风险控制（最大亏损、触发条件）。\n"
+                    "3) 如果用户问题信息不足，最多问 1-2 个澄清点（例如仓位大小、入场价、止损距离）。\n"
+                    "4) 不要编造数据；以用户消息附带的「当前图表K线数据」为准（与发送追问时屏幕上冻结的图表一致）。\n"
+                    "5) K线棒型描述（上影线/下影线/实体大小/涨跌方向）必须以「K1数据·程序计算」字段中的数值为准，\n"
+                    "   禁止凭记忆或猜测描述棒型特征——程序计算的 upper_wick/lower_wick/body 是唯一可信来源。\n"
+                ),
+            }
+        )
+
+        # [1] User — compact analysis reference (stable within this session)
+        # Exclude volatile meta fields (timestamps, api_key) that change every run
+        # and would break prefix caching across analysis records.
+        meta = getattr(base_record, "meta", None)
+        meta_stable: dict = {}
+        if meta is not None:
+            raw = meta.model_dump()
+            meta_stable = {
+                "symbol": raw.get("symbol", ""),
+                "timeframe": raw.get("timeframe", ""),
+                "bar_count": raw.get("bar_count", 0),
+                "decision_stance": raw.get("decision_stance", ""),
+                "model": (raw.get("ai_provider") or {}).get("model", ""),
+            }
+        s1 = getattr(base_record, "stage1_diagnosis", None)
+        s2 = getattr(base_record, "stage2_decision", None)
+        ref = {
+            "meta": meta_stable,
+            "stage1_diagnosis": s1 or {},
+            "stage2_decision": s2 or {},
+        }
+        prefix.append(
+            {
+                "role": "user",
+                "content": (
+                    "## 上次分析结果（仅供参考，不是新的决策任务）\n\n"
+                    f"```json\n{json.dumps(ref, ensure_ascii=False, indent=2)}\n```\n"
+                ),
+            }
+        )
+
+        # [2] Assistant — synthesise a reliable recall summary from the *parsed*
+        # stage2_decision (program-validated JSON), NOT from stage2_response.content
+        # (the raw model output which may contain hallucinated descriptions such as
+        # wrong bar types or non-existent wick characteristics).
+        #
+        # Using the raw response content is dangerous: the model treats whatever it
+        # previously said as ground truth, so any hallucination in the original reply
+        # (e.g. "K1 has a long upper wick") gets recycled verbatim in follow-up turns.
+        # The parsed stage2_decision has already been validated and normalised by the
+        # program, so it is the authoritative source for follow-up context.
+        s2_decision = getattr(base_record, "stage2_decision", None) or {}
+        kline_data = getattr(base_record, "kline_data", None) or []
+        # Build a concise, factual assistant recall message from validated fields only.
+        recall_parts: list[str] = []
+        decision = s2_decision.get("decision") or {}
+        order_type = decision.get("order_type", "不下单")
+        order_dir = decision.get("order_direction")
+        reasoning = decision.get("reasoning", "")
+        watch_points = decision.get("watch_points") or []
+        bar_analysis = s2_decision.get("bar_analysis") or {}
+        # ── K1 factual description (derived directly from kline_data, not from
+        #    the model's potentially erroneous prose) ──────────────────────────
+        k1_desc = ""
+        if kline_data:
+            k1 = kline_data[0]  # seq=1, newest closed bar
+            k1_open = k1.get("open", 0)
+            k1_high = k1.get("high", 0)
+            k1_low = k1.get("low", 0)
+            k1_close = k1.get("close", 0)
+            k1_vol = k1.get("volume", 0)
+            upper_wick = round(k1_high - max(k1_open, k1_close), 3)
+            lower_wick = round(min(k1_open, k1_close) - k1_low, 3)
+            body = round(abs(k1_close - k1_open), 3)
+            full_range = round(k1_high - k1_low, 3)
+            body_ratio = round(body / full_range, 2) if full_range > 0 else 0
+            direction_zh = "阴线" if k1_close < k1_open else ("阳线" if k1_close > k1_open else "平盘")
+            k1_bar_type = bar_analysis.get("bar_type", "")
+            k1_desc = (
+                f"K1（最新已收盘）：{direction_zh}，开={k1_open}，高={k1_high}，"
+                f"低={k1_low}，收={k1_close}，量={k1_vol}；"
+                f"实体={body}（占比{body_ratio:.0%}），上影={upper_wick}，下影={lower_wick}；"
+                f"程序分类：{k1_bar_type}。"
+            )
+        recall_parts.append(f"【上次决策结果】{order_type}" + (f"（{order_dir}）" if order_dir else ""))
+        if k1_desc:
+            recall_parts.append(f"【K1数据·程序计算】{k1_desc}")
+        if reasoning:
+            # Truncate to avoid token bloat; the key facts are already in k1_desc
+            recall_parts.append(f"【决策推理摘要】{reasoning[:600]}" + ("…" if len(reasoning) > 600 else ""))
+        if watch_points:
+            recall_parts.append("【关注点】" + "；".join(watch_points[:3]))
+        recall_content = "\n".join(recall_parts)
+        if recall_content.strip():
+            prefix.append(
+                {
+                    "role": "assistant",
+                    "content": recall_content,
+                }
+            )
+
+        return prefix
 
     def send(
         self,
@@ -147,45 +284,7 @@ class FreeChatSession:
         turn_number = self._turn
 
         # ── 1. Build history_for_api ──────────────────────────────────────────
-        history_for_api: list[dict] = []
-
-        # Follow-up system prompt (NOT the Stage2 decision JSON prompt).
-        history_for_api.append(
-            {
-                "role": "system",
-                "content": (
-                    "你是 PA Agent 的【追问助手】（post-analysis advisor），不是在执行新的完整两阶段分析。\n"
-                    "你的目标是：优先、直接回答用户当前问题；必要时引用价格行为/关键价位/风险控制。\n"
-                    "\n"
-                    "严格规则：\n"
-                    "1) 默认用自然语言回答；除非用户明确要求 JSON/决策树，否则不要输出二元决策树 JSON。\n"
-                    "2) 如果用户问的是【已有仓位管理】（止损/止盈/减仓/持有/加仓）：\n"
-                    "   - 只围绕持仓管理回答，不要重新跑完整下单决策。\n"
-                    "   - 先给结论（可以/不建议/条件允许），再给依据（结构/关键位/信号），再给风险控制（最大亏损、触发条件）。\n"
-                    "3) 如果用户问题信息不足，最多问 1-2 个澄清点（例如仓位大小、入场价、止损距离）。\n"
-                    "4) 不要编造数据；以用户消息附带的「当前图表K线数据」为准（与发送追问时屏幕上冻结的图表一致）。\n"
-                ),
-            }
-        )
-
-        # Provide a compact reference summary of the last completed analysis.
-        meta = getattr(self._base_record, "meta", None)
-        s1 = getattr(self._base_record, "stage1_diagnosis", None)
-        s2 = getattr(self._base_record, "stage2_decision", None)
-        ref = {
-            "meta": meta.model_dump() if meta is not None else {},
-            "stage1_diagnosis": s1 or {},
-            "stage2_decision": s2 or {},
-        }
-        history_for_api.append(
-            {
-                "role": "user",
-                "content": (
-                    "## 上次分析结果（仅供参考，不是新的决策任务）\n\n"
-                    f"```json\n{json.dumps(ref, ensure_ascii=False, indent=2)}\n```\n"
-                ),
-            }
-        )
+        history_for_api: list[dict] = list(self._cached_prefix)  # copy stable prefix
 
         # Previous free-chat turns from history_full
         for msg in self._history_full:

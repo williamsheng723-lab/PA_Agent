@@ -265,7 +265,10 @@ def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
     )
     assert out["decision"]["order_type"] == "不下单"
     assert out["decision"]["entry_price"] is None
-    assert out["decision_trace"][0]["answer"] == "否"
+    # Node 10.3 should have answer=否 (now may not be first after §9 node injection)
+    trace_103 = next((n for n in out["decision_trace"] if n.get("node_id") == "10.3"), None)
+    assert trace_103 is not None, "node 10.3 should be in decision_trace"
+    assert trace_103["answer"] == "否"
     assert out["terminal"]["node_id"] == "10.3"
     assert out["terminal"]["outcome"] == "reject"
 

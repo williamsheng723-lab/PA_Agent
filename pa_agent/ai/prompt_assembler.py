@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 import logging
 import math
@@ -86,7 +87,9 @@ _STAGE1_TAIL_REMINDER = (
 _STAGE2_TAIL_REMINDER = (
     "【最后一步·必做】思考结束后，立即在 assistant 正文 `content` 输出完整阶段二裸 JSON"
     "（含 decision、decision_trace、terminal）。思考用简体中文并尽量简洁；`content` 不得为空。"
-    "若 token 紧张，优先保证 `content` 有 JSON，可缩短思考。"
+    "若 token 紧张，优先保证 `content` 有 JSON，可缩短思考。\n"
+    "⚠️ 禁止在 content 中只写思考过程或分隔符（如 ---输出JSON---）而不附 JSON——"
+    "这会导致校验直接失败。哪怕只输出最小骨架 {\"decision\":{\"order_type\":\"不下单\",...}} 也比没有强。"
 ).strip()
 
 # ── Hardcoded output format reminders ─────────────────────────────────────────
@@ -138,13 +141,12 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
   ],
   "gate_trace": [
     {
-      "node_id": "0.1",
-      "question": "是否看得懂当前市场？",
+      "node_id": "1.2",
+      "question": "是否能识别出当前市场周期？",
       "answer": "是",
-      "action": "继续",
-      "reason": "结构清晰",
-      "branch": "yes",
-      "section": "总原则",
+      "reason": "K线结构特征清晰，可识别为正常通道",
+      "branch": "normal_channel",
+      "section": "K线识别",
       "bar_range": "由你填写，如 K42-K1"
     }
   ],
@@ -152,14 +154,20 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 }
 ```
 
-## 阶段一闸门（二元决策树 §0–§2，必须执行）
+## 阶段一闸门（二元决策树 §1–§2，必须执行）
 
-在输出诊断 JSON 前，按《二元决策_闸门.txt》**依次**评估以下节点，并写入 gate_trace：
-**当 gate_result=proceed 时，必须包含节点 0.1、0.2、1.1、1.2、1.3、2.1、2.2、2.3、2.4、2.5 共 10 条**（每条独立 reason 与 bar_range，禁止照抄示例）：
-§0：0.1 看得懂市场 → 0.2 是否具备继续分析的条件（定性，**不是**交易者方程）
-§1：1.1 数据足够 → 1.2 识别周期 → 1.3 极端混乱
-- **节点 1.2**：answer 用 是/否；识别出的周期类型写在 **branch**（如 `broad_channel`、`trading_range`），**禁止** branch 写 `yes`/`no`（与 0.1/1.1 不同）。
-§2：2.1 惯性方向 → 2.2 大时间框架 → 2.3 多/空/中性 → 2.4 Always In 状态 → 2.5 惯性强度（**answer 只能用 是/否/中性**；方向或 AIL/AIS 写在 branch，勿写「多头」「空头」作 answer）
+在输出诊断 JSON 前，按《二元决策.txt》与内置提示文本**依次**评估以下节点，并写入 gate_trace：
+**当 gate_result=proceed 时，必须包含节点 1.2、1.3、2.1、2.2、2.5 共 5 条（§1.1/§2.3/§2.4 由程序判定，AI 不输出）**（每条独立 reason 与 bar_range，禁止照抄示例）：
+§1：**§1.1 由程序判定**（数据量已通过前置闸门确认）→ 1.2 识别周期 → 1.3 极端混乱
+- **节点 1.2**：answer 用 是/否；识别出的周期类型写在 **branch**（如 `broad_channel`、`trading_range`），**禁止** branch 写 `yes`/`no`。
+§2：2.1 惯性方向 → 2.2 大时间框架 → **§2.3/§2.4 由程序判定，AI 不输出** → 2.5 惯性强度（**answer 只能用 是/否/中性**；方向或 AIL/AIS 写在 branch，勿写「多头」「空头」作 answer）
+
+**§2.5 重要说明：§2.5 answer=否/中性 ≠ gate_result=wait。**
+- §2.5 answer=否 或 answer=中性：均只代表惯性不足、不做激进趋势跟踪，**阶段二分析必须继续进入**，gate_result 必须为 **proceed**。
+- **禁止**因 §2.5 判断惯性不足（否/中性）而将 gate_result 设为 wait——这是最常见的错误。
+- gate_result=wait 只在以下情况下才成立：§1.2 无法识别周期（unknown）、§1.3 极端混乱（extreme_tr）。
+- **校验硬规则**：当 gate_result=wait 时，gate_trace 最后一个节点的 answer 必须是"否"或"等待"，不得为"中性"。
+- §2.5 答"否"或"中性"时，gate_result 仍为 proceed，阶段二切换为"等待反弹/回撤到位后的顺势信号"策略，并在 watch_points 中明确触发条件。
 
 **禁止在阶段一评估：**
 - **0.3**（交易者方程仅为原则；数值检验在阶段二 **10.3**）
@@ -170,8 +178,28 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 - 每条只写该 K 线对当前结构的增量作用，不写下单价格、不写止损止盈。
 - `role` 只能使用示例中的 8 个英文枚举；延续/跟随棒统一写 `confirmation`，不要写 `continuation`。
 - K线序号方向：K1 是最新已收盘，K2 是它前一根；判断 K2 的后续跟随时看 K1，判断 K3 的后续跟随时看 K2/K1；K1 的跟随通常为 pending。
-- `bar_type` 必须优先对齐程序提供的 K线几何特征表。
+- `bar_type` **必须与程序 K线几何特征表中该 K 线的 bar_type 完全一致，禁止覆盖**。程序的几何判定是权威来源；如果你认为实体是阳线但程序判定为 `trend_bear`，你的判断必须服从程序——可以在 `reason` 里说明（如"程序判定 trend_bear，下影线较长，但整体收阴"），但 `bar_type` 字段必须填程序值。写错会导致校验失败。
 - `context_effect` 必须使用 **strengthens_bull / strengthens_bear**（带 s），禁止写 strengthen_bull、strengthen_bear。
+
+**node_overrides（可选，默认不输出）：**
+程序已为 §1.1/§2.3/§2.4 填充权威判定，**默认不要输出这些节点**。
+仅当你识别到程序规则**未捕捉到**的明确结构性依据时，在顶层 `node_overrides` 数组中提交覆盖：
+```json
+"node_overrides": [
+  {"node_id": "2.3", "answer": "是", "branch": "bearish", "override_reason": "近3根出现强势看跌反转，斜率窗口未捕捉到该结构突变"}
+]
+```
+约束：§1.1/§9.1 为锁定节点不可覆盖；安全闸门（§10.3/§14）只能朝更保守方向；§2.3 answer/branch 须自洽（bullish/bearish↔是，neutral↔中性）；不输出时请勿包含该字段。
+
+**§2.3 覆盖门槛（三项全部满足才允许提交）：**
+1. 指明具体是哪根 K 线（如 K2、K1）、哪个结构特征（如强势空头趋势棒跌破颈线、MTR 双确认）导致方向突变；
+2. 该特征明确超出程序三信号（EMA斜率/收盘重心位移/波段结构枢轴）的计算范围——例如出现程序窗口未捕捉到的突破/假突破/多空角力转换；
+3. override_reason 须用具体 K 线序号和价格结构描述，不接受"整体看跌""趋势感觉已变"等模糊表述。
+
+**§2.4 覆盖门槛（三项全部满足才允许提交）：**
+1. 程序判定的 §2.4 reason 字段中**已出现** "⚠️ 近N根K线…与全窗口…结论存在背离"预警，或近期 K 线有明确的 EMA 跌破/站上事件（收盘价穿越 EMA20 且后续 K 线未立即修复）；
+2. 指明具体是哪几根 K 线导致短期背离（如"K1-K5 有4根收于 EMA 下方"）；
+3. override_reason 须同时说明：①短窗口背离的具体数据（几根中几根）；②为何认为该背离足以推翻全窗口 AIL/AIS 判定而非只是正常回撤。
 
 规则：
 - answer 只能是：是 / 否 / 中性 / 等待 / 不适用（**禁止**写「部分」「待确认」「待定」等——部分一致用 **中性**，尚需下一根K线确认用 **等待**）
@@ -247,7 +275,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
   "bar_analysis": {
     "always_in": "long|short|neutral",
     "last_closed_bar": "K1",
-    "bar_type": "trend_bull|trend_bear|doji|inside|outside_bull|outside_bear|flat|other",
+    "bar_type": "【必须与阶段一 bar_analysis.bar_type 完全一致，不得重新推断】trend_bull|trend_bear|doji|inside|outside_bull|outside_bear|flat|other",
     "signal_bar": {
       "bar": "K2 或 null（计划型挂单尚无已收盘信号棒时为 null）",
       "quality": "strong|medium|weak|invalid",
@@ -255,7 +283,6 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
       "reason": "信号棒质量判断"
     },
     "entry_bar": {
-      "bar": "K1 或 null（限价/突破挂单尚未触发时为 null）",
       "strength": "strong|weak|not_triggered",
       "follow_through": true,
       "still_valid": true,
@@ -290,15 +317,51 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 **每条 trace 的 answer 只能是以下五选一**：`是`、`否`、`中性`、`等待`、`不适用`。
 禁止写「部分符合」「部分是」「上涨通道」等；模糊或分类细节写在 **reason**（方向类节点可另填 **branch**）。
 
+**⚠️ diagnosis_summary.direction 与阶段一 direction 不一致时的强制规则：**
+
+**⚠️ bar_analysis.bar_type 强制规则：必须直接沿用阶段一 `bar_analysis.bar_type` 的值，禁止在阶段二重新推断或修改。** 阶段一几何特征表是程序的确定性计算结果，是权威来源。如果你认为 K1 的棒型与实际不符，可以在 reasoning 里说明，但 `bar_type` 字段必须等于阶段一给出的值。
+
+**⚠️ bar_type 两套分类体系说明（不矛盾，两个维度互补）：**
+- **几何特征表（程序预计算）中的"类型"列**：描述单根 K 线的**内部几何**（实体比、收盘位置）。`trend_bear` = 实体占主导、收盘接近低点。
+- **bar_analysis.bar_type 与 bar_by_bar_summary.bar_type**：描述该 K 线与**前一根**的关系结构。`outside_bear` = 高低点均超出前棒（外包）且收盘偏低。
+- **同一根 K 线完全可以同时是两种**：例如 K1 几何上是 `trend_bear`（实体 62%）、关系上是 `outside_bear`（外包吞没前棒）——两者不矛盾，是不同维度的描述。不要因为几何表显示 `trend_bear` 就认为关系分类"错误"。
+- `diagnosis_summary.direction` 必须与 `stage1.direction` **保持一致**，除非你在阶段二的 decision_trace 中以 **node_id="2.3"** 明确记录方向变更及原因。
+- **例外（无需 2.3 节点）**：
+  - 阶段一 direction=**neutral** → 阶段二 direction=bullish/bearish：程序判不了方向时 AI 阶段二识别出方向属于正常补充，校验器已尅5豪免。不强制补写 2.3，但建议补（给本人看更清晰）。
+  - 阶段二 将 direction 覆盖为 neutral 且周期属于震荡类（trading_range / extreme_tr / trending_tr）时。
+- 若阶段一 direction=bullish/bearish，而阶段二判断方向反转，**必须**在 decision_trace 中加入：
+  ```json
+  {"node_id": "2.3", "section": "方向重判", "question": "阶段二是否重新判定市场方向？", "answer": "是", "branch": "bullish", "reason": "说明为何方向改变的具体依据", "skipped": false, "bar_range": "由你填写"}
+  ```
+  做空方向则 `"branch": "bearish"`。**`branch` 字段必须填写且值必须与 `diagnosis_summary.direction` 完全一致**（`bullish` 或 `bearish`）。
+- 其他情况若未加 2.3 节点而 direction 不同，校验器**必定报错**。最稳妥的做法：**让 diagnosis_summary.direction 直接沿用阶段一的 direction 值**，只在有充分依据时才覆盖。
+
 ## 阶段二决策路径（二元决策树 §3–§11、§14）
 
 阶段一 gate_result=proceed 时，decision_trace 必须遵守**执行顺序**（可跳过不适用分支，但不可乱序）：
 
 1. **§3–§8** 按 cycle_position 走对应结构分支（尖峰/通道/区间/反转/楔形等）
-2. **§9** 入场信号二元检查（9.0→9.7，须先确认信号 K 线质量、二次入场与入场棒跟随）
+2. **§9** 入场信号二元检查（须先确认信号 K 线质量、二次入场与入场棒跟随）：
+   - **§9.0、§9.4、§9.6、§9.7 由 AI 判定**，须写入 decision_trace
+   - **§9.1/§9.2/§9.3/§9.5 由程序填充，AI 不输出**（程序依据几何特征确定性判断）
 3. **§10** 风险收益（必须按序）：**10.1 止损明确 → 10.2 止损不过大 → 10.3 交易者方程**（勿编造具体手数、合约数或资金规模）
-4. **§11** 下单方式（仅当 10.3 为「是」且拟下单时评估 11.1–11.4）
+4. **§11 下单方式由程序填充，AI 不输出**（程序依据 cycle_position 路由，仅当 10.3=是 且下单时填充）
 5. **§14** 禁止行为清单：下单前快速扫描，触犯任一条 → order_type=不下单
+   - **⚠️ §14 answer 语义硬规则（违反会被程序强制改为不下单）：**
+     - `answer=是` = **触犯了禁止行为**（程序据此强制 order_type=不下单）
+     - `answer=否` = **未触犯任何禁止项**（可以继续下单）
+   - **未触犯时必须写 `answer=否`**，不能写 `是`。许多 AI 误用 `是` 表示"已完成扫描"，这是错误的。
+   - 例：扫描完成、无触犯 → `{"node_id":"14","answer":"否","reason":"扫描§14：未触犯任何禁止项。①...②..."}`
+   - 例：触犯了宽通道追突破 → `{"node_id":"14","answer":"是","reason":"触犯：宽通道中追突破，放弃入场，order_type=不下单"}`
+
+**node_overrides（可选，默认不输出）：**
+仅当你识别到程序规则未捕捉到的明确结构性依据时，在顶层 `node_overrides` 数组中提交覆盖（如改变 §9.2/§9.3/§11 路由）：
+```json
+"node_overrides": [
+  {"node_id": "9.3", "answer": "否", "override_reason": "信号棒虽ATR比值略超2，但止损结构合理，程序未考虑此场景"}
+]
+```
+约束：§9.1 为锁定节点不可覆盖；§11 可横向切换（限价/突破/市价），但「不下单」不能改为下单；不输出时请勿包含该字段。
 
 **交易者方程（10.3）规则：**
 - 必须使用 **decision 中已填写的 entry_price / stop_loss_price / take_profit_price** 做数值计算，**禁止**用 K 线收盘、信号棒极点间距或「计划中的 1.8 点/3 点」代替三价
@@ -329,6 +392,17 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 - 如果最新 K1 是 doji、弱入场棒、无跟随或反向确认，必须降低 trade_confidence；除非有非常明确的二次入场/突破测试证据，否则 order_type=不下单。
 - 当 `bar_analysis.signal_bar.quality=weak|invalid`，或已触发入场棒但 `entry_bar.follow_through=false` 时，若仍下单，必须在 §9 和 reasoning 中明确说明为何该弱点未使信号失效；否则应等待。挂单未触发时不得把 `follow_through=false` 当作失败跟随，应写 `pending`。
 
+**⚠️ watch_points 与 stage1 risk_warning 一致性规则（必须遵守）：**
+- 阶段一 `risk_warning` 是风险警示，**watch_points 中的触发条件不得与其直接矛盾**。
+- 典型违反：risk_warning 说"在 4435–4440 底轨区域不宜追空"，watch_points 却建议"下破 4438 追空"——这是在 risk_warning 明确警示的区域做 risk_warning 禁止的操作。
+- **写 watch_points 前必须回顾 stage1 risk_warning**：如果你的触发条件恰好落在 risk_warning 描述的风险区域，必须在 watch_points 里注明该风险或修改触发条件以避开冲突区域。
+- 如果有充分依据认为 risk_warning 的风险在阶段二已经消除，必须在 reasoning 里明确说明原因。
+
+**⚠️ detected_patterns 必须引用规则：**
+- 阶段一 `detected_patterns` 中识别出的每一个形态（如 `failed_signal`、`magnet`、`breakout_test`、`breakout_failure`）都与当前交易风险直接相关。
+- **阶段二 reasoning 和 watch_points 中必须明确引用 detected_patterns 中的形态**，说明它们对本次交易决策的影响（支持还是否定入场，或设为 watch 条件）。
+- 不得从头重新推理而完全忽略 detected_patterns 中已识别的形态。
+
 **跳过规则：**
 - 无持仓：跳过 §12、§13（不写 trace）
 - 不适用分支：skipped:true，answer=不适用
@@ -337,6 +411,20 @@ terminal 必须与 order_type 一致（**decision 与 decision_trace 同步**）
 - 有下单 → outcome=trade，10.3 必须为「是」，decision 含有效三价
 - 不下单 → outcome=wait 或 reject，order_type=不下单，三价与 order_direction 均为 null
 - **禁止** decision 写突破单/限价单/市价单，同时 decision_trace 里 10.3=否 或 terminal=reject
+
+**⚠️ terminal.node_id 和 outcome 的语义规则（必须区分以下两种情形）：**
+
+情形 A：**有入场计划，但交易者方程不通过**（有具体止损、止盈数字，但盈亏比不达标）
+→ `terminal.node_id = "10.3"`，`outcome = "reject"`
+→ 典型表现：10.3 trace 里有具体数值计算，方程结果为负
+
+情形 B：**根本没有入场计划可评估**（§9.0=否/等待，或 §10.1=否 因无止损锚点）
+→ `terminal.node_id = "9.0"`（或最早的否定节点），`outcome = "wait"`
+→ **不能** terminal 在 10.3，因为从未有过可评估的交易方案
+→ **不能** 写 outcome="reject"——拒绝一个不存在的方案在语义上是无意义的
+
+常见错误：§9.0=否 → §10.1=否 → §10.3 写"不适用"或"否" → terminal=10.3/reject
+正确做法：§9.0=否 时 terminal 应是 §9.0，outcome=wait，10.3 不应出现在 trace 里（或标 skipped=true）
 
 阶段一 gate_result 为 wait/unknown 时：系统会短路，不应调用本阶段。
 
@@ -363,7 +451,7 @@ trade_confidence_reasoning：必须简要说明打分依据（如“入场信号
 三、estimated_win_rate —— 对**本笔交易方案**成交后获利概率的主观估计（0–100 整数）
 - 与 trade_confidence **不是同一概念**：trade_confidence 是对「是否该做这笔决策」的把握；estimated_win_rate 是「若按该 entry/stop/target 成交，你认为获胜的概率」
 - **必须在 §10.3 交易者方程评估完成后**由你自行判断并填写；须与 10.3 节点 reason 中的胜率假设一致
-- order_type=「不下单」时：estimated_win_rate 填 **null**，estimated_win_rate_reasoning 可说明为何不交易
+- order_type=「不下单」时：estimated_win_rate 填 **null**，estimated_win_rate_reasoning 填 **null**（无交易方案，无胜率可估）
 - 有下单时：estimated_win_rate 为 **必填整数**（不要填区间字符串，取你判断的最可能值，如 47）
 estimated_win_rate_reasoning：必须简要说明依据（如“宽通道顺势 Low1，结构支持约 45–50%，取 47% 用于方程”）
 """.strip()
@@ -390,11 +478,59 @@ _NEXT_BAR_PREDICTION_INSTRUCTION = """\
 2. direction 必须等于 probabilities 中数值最大的键；并列最大时取 JSON 出现顺序中靠前的键
    （即按 bullish → bearish → neutral 的字面顺序）。
 3. reasoning 长度 30–1500 字，简体中文，不写下单价格、不写止损止盈，仅讨论方向与概率依据。
-4. features_used 至少包含 "stage1_diagnosis"；若提示词中提供了对应来源，应同步包含
-   "kline_features" / "analysis_history" / "experience_library"。
+4. features_used 合法取值封闭列表（只能从下方选对应值，禁止自造字符串）：
+   "stage1_diagnosis"、"kline_features"、"analysis_history"、"experience_library"、"stage2_decision"、"previous_prediction_summary"。
+   至少包含 "stage1_diagnosis"；若提示词中提供了对应来源，应同步包含
+   "kline_features" / "analysis_history" / "experience_library" / "previous_prediction_summary"。
 5. 数据不足（K 线数 < 8）、或阶段一诊断为 extreme_tr / unknown、或市场极端混乱时：
    设 unpredictable=true，direction=null，probabilities=null，reasoning 写明原因。
 6. 此预测**不**进入交易者方程、**不**改变 decision 中任意字段，仅作辅助参考。
+""".strip()
+
+_NEXT_CYCLE_PREDICTION_INSTRUCTION = """\
+## 下一个市场周期预测任务（阶段二附加输出，不影响下单决策）
+
+完成 next_bar_prediction 后，必须在阶段二 JSON 顶层追加键 `next_cycle_prediction`，
+表达对当前市场周期结束后、下一个市场周期的预测：
+
+```json
+"next_cycle_prediction": {
+  "cycle": "broad_channel",
+  "direction": "bullish",
+  "probabilities": {
+    "spike": 3,
+    "micro_channel": 5,
+    "tight_channel": 8,
+    "normal_channel": 20,
+    "broad_channel": 35,
+    "trending_tr": 15,
+    "trading_range": 10,
+    "extreme_tr": 4
+  },
+  "reasoning": "简体中文理由，1–1500 字。须引用阶段一周期诊断、K 线结构演变特征，说明各周期概率依据。",
+  "unpredictable": false,
+  "features_used": ["stage1_diagnosis", "kline_features"]
+}
+```
+
+市场周期枚举（cycle 字段的合法取值，共 8 个，不含 unknown）：
+spike | micro_channel | tight_channel | normal_channel | broad_channel | trending_tr | trading_range | extreme_tr
+
+硬约束（违反则整体阶段二 JSON 校验失败）：
+
+1. probabilities 八个值均为 0–100 整数，八者之和必须落在 [99, 101]（容差 ±1，源于取整）。
+2. cycle 必须等于 probabilities 中数值最大的键；并列最大时按上方枚举的字面顺序取靠前者
+   （即 spike → micro_channel → tight_channel → normal_channel → broad_channel → trending_tr → trading_range → extreme_tr）。
+3. direction 为独立的方向预测（bullish / bearish / neutral），不由 cycle argmax 强制推导；
+   表达的是预测下一个周期时市场整体偏向的方向。
+4. reasoning 长度 1–1500 字，简体中文，仅讨论周期演变依据，不写下单价格、不写止损止盈。
+5. features_used 合法取值封闭列表（只能从下方选对应值，禁止自造字符串）：
+   "stage1_diagnosis"、"kline_features"、"analysis_history"、"experience_library"、"stage2_decision"、"previous_prediction_summary"。
+   至少包含 "stage1_diagnosis"；若提示词中提供了对应来源，应同步包含
+   "kline_features" / "analysis_history" / "experience_library" / "previous_prediction_summary"。
+6. 数据不足（K 线数 < 8）、或阶段一诊断为 extreme_tr / unknown、或市场极端混乱时：
+   设 unpredictable=true，cycle=null，direction=null，probabilities=null，reasoning 写明原因。
+7. 此预测**不**进入交易者方程、**不**改变 decision 中任意字段，仅作辅助参考。
 """.strip()
 
 # txt files merged into each stage prompt (order preserved)
@@ -555,6 +691,43 @@ class PromptAssembler:
             return False
         return bool(getattr(cfg, "stage2_load_full_strategy_library", False))
 
+    # ── Process-level system-prompt cache ────────────────────────────────────
+    # DeepSeek KV Cache hits require the *prefix* of consecutive requests to
+    # be byte-identical.  System prompts are fully static (persona + txt files)
+    # and never change during a session, so we cache them at the process level.
+    # Key = (prompt_dir_str, stage) so different PromptAssembler instances that
+    # point to the same directory share the cache.
+
+    @functools.cached_property
+    def _system_prompt_stage1(self) -> str:
+        """Stage 1 system prompt (cached for the lifetime of this instance)."""
+        return self._build_stage1_system_prompt_inner()
+
+    @functools.cached_property
+    def _system_prompt_stage2(self) -> str:
+        """Stage 2 system prompt (cached for the lifetime of this instance)."""
+        return self._build_stage2_system_prompt_inner()
+
+    def _build_stage1_system_prompt(self) -> str:
+        """Return cached Stage 1 system prompt."""
+        return self._system_prompt_stage1
+
+    def _build_stage2_system_prompt(self) -> str:
+        """Return cached Stage 2 system prompt."""
+        return self._system_prompt_stage2
+
+    def _build_stage1_system_prompt_inner(self) -> str:
+        """Stage 1 system: persona + gate-only decision tree (§0–§2)."""
+        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
+        system_parts.extend(self._load(name) for name in COMMON_SYSTEM_STAGE1_TXT_FILES)
+        return "\n\n---\n\n".join(p for p in system_parts if p)
+
+    def _build_stage2_system_prompt_inner(self) -> str:
+        """Stage 2 system: persona + full decision tree."""
+        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
+        system_parts.extend(self._load(name) for name in COMMON_SYSTEM_STAGE2_TXT_FILES)
+        return "\n\n---\n\n".join(p for p in system_parts if p)
+
     # ── File loading ──────────────────────────────────────────────────────────
 
     def _load(self, filename: str) -> str:
@@ -698,18 +871,6 @@ class PromptAssembler:
             {"role": "user",      "content": incremental_user_content},
         ]
 
-    def _build_stage1_system_prompt(self) -> str:
-        """Stage 1 system: persona + gate-only decision tree (§0–§2)."""
-        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
-        system_parts.extend(self._load(name) for name in COMMON_SYSTEM_STAGE1_TXT_FILES)
-        return "\n\n---\n\n".join(p for p in system_parts if p)
-
-    def _build_stage2_system_prompt(self) -> str:
-        """Stage 2 system: persona + full decision tree."""
-        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
-        system_parts.extend(self._load(name) for name in COMMON_SYSTEM_STAGE2_TXT_FILES)
-        return "\n\n---\n\n".join(p for p in system_parts if p)
-
     def _stage1_pattern_supplement(self) -> str:
         """Pattern tag table + briefs for Stage 1 (optional via settings)."""
         if self._prompt_settings is not None and not getattr(
@@ -718,9 +879,78 @@ class PromptAssembler:
             return ""
         return f"{STAGE1_DETECTED_PATTERNS_GUIDE}\n\n---\n\n{STAGE1_PATTERN_BRIEFS_BLOCK}"
 
+    @staticmethod
+    def _render_program_prefill_hint(frame: KlineFrame) -> str:
+        """Render a compact block showing program pre-computed node verdicts.
+
+        This is injected into the Stage 1 user prompt so the AI can see
+        exactly what the deterministic engine computed for §1.1 / §2.3 / §2.4
+        *before* making its own judgement.  The AI can still override via
+        node_overrides when it sees structural evidence the program missed.
+
+        Why this matters (from prompt_engineering 二元决策.txt §2.3/§2.4):
+        - §2.3 direction is now a 5-signal vote; each signal value is exposed
+          so the AI knows which signals contributed and why.
+        - §2.4 Always In now has 3 gates (ratio, slope, swing+pullback); the
+          AI can see whether Gate 3 confirmed or was weak.
+        """
+        try:
+            from pa_agent.ai.decision_nodes import (
+                judge_data_sufficiency,
+                judge_direction,
+                judge_always_in,
+            )
+            import copy
+
+            hint_lines: list[str] = [
+                "## 程序预填充节点判断依据（§1.1 / §2.3 / §2.4，供 AI 参考）",
+                "",
+                "程序已确定性计算以下节点，结果将写入 gate_trace。"
+                "你可以在理解以下依据后，于 node_overrides 中提交有充分理由的覆盖。",
+                "",
+            ]
+
+            # §1.1
+            fill_11 = judge_data_sufficiency(frame)
+            hint_lines.append(f"**§1.1 数据是否足够** → {fill_11.answer}")
+            hint_lines.append(f"  依据：{fill_11.reason}")
+            hint_lines.append("")
+
+            # §2.3
+            direction, fill_23 = judge_direction(frame)
+            hint_lines.append(
+                f"**§2.3 当前方向（多/空/中性）** → {fill_23.answer}"
+                + (f"（branch={fill_23.branch}）" if fill_23.branch else "")
+            )
+            hint_lines.append(f"  依据：{fill_23.reason}")
+            hint_lines.append("")
+
+            # §2.4
+            fill_24 = judge_always_in(frame)
+            hint_lines.append(
+                f"**§2.4 是否 Always In** → {fill_24.answer}"
+                + (f"（branch={fill_24.branch}）" if fill_24.branch else "")
+            )
+            hint_lines.append(f"  依据：{fill_24.reason}")
+            hint_lines.append("")
+
+            hint_lines.append(
+                "⚠️ §1.1 为锁定节点不可覆盖。§2.3/§2.4 可通过 node_overrides 覆盖，"
+                "但门槛较高：\n"
+                "  • §2.3 覆盖须指明具体 K 线序号+结构特征，且该特征超出三信号（EMA斜率/收盘重心/波段枢轴）的计算范围；\n"
+                "  • §2.4 覆盖须先确认 reason 中是否已出现短窗口背离预警（⚠️标记），"
+                "并给出具体背离数据（几根中几根收盘偏向反方向）及推翻全窗口判定的理由；\n"
+                "  • override_reason 必须具体，不接受「整体看跌」「感觉已变」等模糊描述。"
+            )
+            return "\n".join(hint_lines)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_render_program_prefill_hint failed: %s", exc)
+            return ""
+
     def _build_stage1_user_prompt(self, frame: KlineFrame) -> str:
         """Build the Stage 1 task turn; stage-specific rules stay out of system."""
         pattern_block = self._stage1_pattern_supplement()
+        prefill_hint = self._render_program_prefill_hint(frame)
         stage1_parts = [
             *(self._load(name) for name in STAGE1_TASK_PROMPT_TXT_FILES),
             *([pattern_block] if pattern_block else []),
@@ -739,13 +969,31 @@ class PromptAssembler:
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars}\n"
             f"（K线序号：1=最新已收盘，最大 K{n_bars}；"
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
+            f"## ⚠️ 分析窗口分层规则（强制，必须遵守）\n\n"
+            f"你收到全部 {n_bars} 根 K 线数据，但分析深度必须严格分层：\n\n"
+            f"**详细分析区 K1–K40（最近约 10 小时）：**\n"
+            f"- bar_by_bar_summary 覆盖此区间\n"
+            f"- 通道/波段/趋势结构识别、信号棒识别、趋势棒计数、反转判断\n"
+            f"- market_phase 和 cycle_position 判断基于**此区间**的结构特征\n"
+            f"- 各闸门节点的 bar_range 优先选取此区间\n\n"
+            f"**结构背景区 K41–K{n_bars}（更早期）：**\n"
+            f"- **只提取重要的 swing highs/lows（波段高点和低点）**\n"
+            f"- 将这些关键价位写入 `htf_context` 字段，格式示例：\n"
+            f"  「K65 高点 2685、K80 低点 2632、K92 高点 2698」\n"
+            f"- **禁止** 对 K41–K{n_bars} 做逐棒分析、通道识别、趋势结构、信号判断\n"
+            f"- **禁止** 在 bar_by_bar_summary 中涵盖 K41 及更早的 K 线\n"
+            f"- **禁止** 用 K41–K{n_bars} 的结构判断大时间框架（HTF）方向——"
+            f"其作用仅限于提供价格水平参考（潜在的支撑/阻力/磁力位）\n"
+            f"- K41–K{n_bars} 的高低价位只在 node 2.2 中作为**次要参考**，"
+            f"不作为 HTF 方向的否决依据\n\n"
             f"## K线数据(序号1=最新已收盘K线,序号越大越早;不含当前未收盘K线;"
             f"阳阴列由程序按收盘价与开盘价计算:收盘>开盘=阳线,收盘<开盘=阴线,相等=平)\n\n"
             f"{kline_table}\n\n"
             "## K线几何特征(程序预计算，仅作客观辅助；类型为单棒分类，不替代周期判断；"
             "基于当前 N 根已收盘 K 线，指标非全历史延续)\n\n"
             f"{feature_table}\n\n"
-            f"请根据以上数据，严格输出阶段一 JSON 诊断结果。\n\n"
+            + (f"{prefill_hint}\n\n" if prefill_hint else "")
+            + f"请根据以上数据，严格输出阶段一 JSON 诊断结果。\n\n"
             f"{_STAGE1_TAIL_REMINDER}"
         )
 
@@ -757,6 +1005,7 @@ class PromptAssembler:
     ) -> str:
         """Build a Stage 1 update turn using the last completed analysis."""
         pattern_block = self._stage1_pattern_supplement()
+        prefill_hint = self._render_program_prefill_hint(frame)
         stage1_parts = [
             *(self._load(name) for name in STAGE1_TASK_PROMPT_TXT_FILES),
             *([pattern_block] if pattern_block else []),
@@ -789,7 +1038,7 @@ class PromptAssembler:
             '"summary":"相对上一轮：新增K1突破区间上沿，方向由中性转偏多"}\n'
             "- new_closed_bars 长度必须等于「新增已收盘K线」数量（1根则只写 [\"K1\"]）。\n"
             "- 并在 summary / risk_warning / gate_trace 中说明相对上一轮变化。\n"
-            "- gate_result=proceed 时 gate_trace 仍须覆盖 §0–§2 全部闸门节点（0.1–2.5）。\n"
+            "- gate_result=proceed 时 gate_trace 仍须覆盖 §1.2、§1.3、§2.1、§2.2、§2.5（§1.1/§2.3/§2.4 由程序填充）。\n"
             "- 输出仍必须是完整阶段一 JSON，而不是差异补丁。\n\n"
             f"{stage1_context}\n\n"
             "---\n\n"
@@ -809,7 +1058,8 @@ class PromptAssembler:
             f"## 当前完整 K线几何特征(用于逐棒辅助，不替代周期判断；"
             f"基于当前 N 根已收盘 K 线，指标非全历史延续)\n\n"
             f"{full_feature_table}\n\n"
-            "请基于上一轮结论、新增K线和当前完整K线，严格输出更新后的阶段一 JSON 诊断结果。\n\n"
+            + (f"{prefill_hint}\n\n" if prefill_hint else "")
+            + "请基于上一轮结论、新增K线和当前完整K线，严格输出更新后的阶段一 JSON 诊断结果。\n\n"
             f"{_STAGE1_TAIL_REMINDER}"
         )
 
@@ -823,7 +1073,10 @@ class PromptAssembler:
 
         Only sends NEW K-line data; the model can reference the full K-line table
         from the previous Stage 1 user message ([1]) above.
+        Injects prefill_hint so the AI knows the updated §2.3/§2.4 verdicts
+        even though the full K-line table is not re-sent.
         """
+        prefill_hint = self._render_program_prefill_hint(frame)
         n_bars = len(frame.bars)
         new_count = max(0, min(new_bar_count, n_bars))
         new_kline_table = self._render_kline_table(frame, limit=new_count)
@@ -854,7 +1107,7 @@ class PromptAssembler:
             '"summary":"相对上一轮：新增K1突破区间上沿，方向由中性转偏多"}\n'
             "- new_closed_bars 长度必须等于「新增已收盘K线」数量（1根则只写 [\"K1\"]）。\n"
             "- 并在 summary / risk_warning / gate_trace 中说明相对上一轮变化。\n"
-            "- gate_result=proceed 时 gate_trace 仍须覆盖 §0–§2 全部闸门节点（0.1–2.5）。\n"
+            "- gate_result=proceed 时 gate_trace 仍须覆盖 §1.2、§1.3、§2.1、§2.2、§2.5（§1.1/§2.3/§2.4 由程序填充）。\n"
             "- 输出仍必须是完整阶段一 JSON，而不是差异补丁。\n\n"
             f"## 当前分析目标更新\n\n"
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars} 新增已收盘K线:{new_count}\n"
@@ -867,7 +1120,8 @@ class PromptAssembler:
             f"## 新增 K线几何特征(共{new_count}根；多棒形态按完整{n_bars}根窗口计算，"
             f"与前棒重叠/内包/ioi 以完整表为准)\n\n"
             f"{new_feature_table}\n\n"
-            "请基于上方完整K线数据、上一轮结论和新增K线，严格输出更新后的阶段一 JSON 诊断结果。\n\n"
+            + (f"{prefill_hint}\n\n" if prefill_hint else "")
+            + "请基于上方完整K线数据、上一轮结论和新增K线，严格输出更新后的阶段一 JSON 诊断结果。\n\n"
             f"{_STAGE1_TAIL_REMINDER}"
         )
 
@@ -948,13 +1202,15 @@ class PromptAssembler:
         Structure:
           [0] system    — Stage 2 system prompt (full decision tree, same as Stage 1)
           [1] user      — Stage 1 original user prompt (with K-line table, from stage1_messages)
-          [2] assistant — Stage 1 reply JSON
-          [3] user      — Stage 2 task prompt (without K-line table)
+          [2] user      — Stage 2 task prompt (without K-line table; embeds S1 diagnosis JSON)
 
-        Benefits:
-        - K-line table sent only once (in [1]), not duplicated in [3]
-        - system prompt identical to Stage 1 → prefix caching hits the full prefix
-        - Model can reference Stage 1 K-line data without re-reading
+        Note: the ``assistant`` role is intentionally omitted.  Including it would
+        make ``messages[2]`` (the S2 user turn) unique every cycle because the
+        prefix preceding it changes — the assistant content contains the S1 reply
+        JSON which varies each run.  Without the assistant message, the prefix is:
+          system (static) + user[S1] (static per symbol/tf/barcount)
+        and the S2 user turn only needs to re-send the dynamic diagnosis JSON,
+        keeping the large strategy-file block fully cached.
         """
         system_content = self._build_stage2_system_prompt()
 
@@ -979,7 +1235,6 @@ class PromptAssembler:
         return [
             {"role": "system",    "content": system_content},
             {"role": "user",      "content": stage1_user_content},
-            {"role": "assistant", "content": stage1_reply_content},
             {"role": "user",      "content": stage2_user_content},
         ]
 
@@ -1027,18 +1282,14 @@ class PromptAssembler:
             )
         stage2_parts.append(_STAGE2_OUTPUT_CONTRACT)
         stage2_parts.append(_NEXT_BAR_PREDICTION_INSTRUCTION)
+        stage2_parts.append(_NEXT_CYCLE_PREDICTION_INSTRUCTION)
         stage2_context = "\n\n---\n\n".join(p for p in stage2_parts if p)
 
         kline_table = self._render_kline_table(frame)
         feature_table = self._render_kline_feature_table(frame)
-        gate_result = stage1_json.get("gate_result", "proceed")
-        gate_trace = stage1_json.get("gate_trace") or []
-        gate_block = ""
-        if gate_trace:
-            gate_block = (
-                f"## 阶段一闸门路径 (gate_result={gate_result})\n\n"
-                f"```json\n{json.dumps(gate_trace, ensure_ascii=False, indent=2)}\n```\n\n"
-            )
+        # gate_trace and gate_result are already included inside the compact
+        # stage1 diagnosis JSON block above; a separate gate_block section
+        # was redundant (they existed twice in the same uncached message).
 
         from pa_agent.util.price_tick import format_breakout_tick_hint
 
@@ -1062,17 +1313,16 @@ class PromptAssembler:
         prev_pred_block = self._render_previous_prediction(previous_record)
         return (
             "## 阶段二任务\n\n"
-            "继续上一轮对话。你已经完成阶段一诊断；现在只执行阶段二：交易决策、风险收益和下单方式评估。\n"
-            "上一轮 assistant 消息是阶段一完整响应，下面的 JSON 是程序校验通过后的阶段一诊断结果，若两者有细微格式差异，以此处 JSON 为准。\n\n"
+            "你现在独立执行阶段二：交易决策、风险收益和下单方式评估（基于阶段一诊断结果）。\n"
+            "以下 JSON 是程序校验通过后的阶段一诊断结果，请以此为权威依据；阶段一 K 线数据见上方阶段一用户消息。\n\n"
             f"{stage2_context}\n\n"
             "---\n\n"
             f"## 阶段一诊断结果\n\n```json\n"
             f"{json.dumps(self._compact_stage1_for_stage2(stage1_json), ensure_ascii=False, indent=2)}"
             f"\n```\n\n"
-            f"{gate_block}"
             f"{kline_block}"
             f"{prev_pred_block + chr(10) if prev_pred_block else ''}"
-            f"请根据以上诊断、闸门路径和K线数据,按《二元决策.txt》§3–§15 输出 JSON 决策结果"
+            f"请根据以上诊断和K线数据,按《二元决策.txt》§3–§15 输出 JSON 决策结果"
             f"(含 decision_trace 与 terminal)。\n"
             f"注意:如果判断不下单,entry_price、take_profit_price、stop_loss_price、order_direction 必须全部为 null。\n\n"
             f"{_STAGE2_TAIL_REMINDER}"

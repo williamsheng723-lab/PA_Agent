@@ -70,6 +70,8 @@ class GeneralSettings(BaseModel):
     chart_seq_label_font_pt: int = Field(default=7, ge=6, le=24)
     #: 两阶段分析结束后是否自动恢复 K 线图表实时刷新
     auto_resume_chart_after_analysis: bool = False
+    #: 持续跟踪分析：有新K线收盘时自动触发新一轮分析
+    keep_analysis: bool = False
 
     @field_validator("last_data_source", mode="before")
     @classmethod
