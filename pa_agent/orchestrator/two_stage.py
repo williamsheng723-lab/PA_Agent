@@ -29,9 +29,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 # Windows console UTF-8 wrapper (avoids GBK errors on Unicode like ⚠️)
-if sys.platform == "win32":
-    import io
-    if hasattr(sys.stdout, "buffer"):
+# Skip if already UTF-8 (e.g. pytest capture, VS Code terminal, or already wrapped)
+if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
+    _enc = getattr(sys.stdout, "encoding", "") or ""
+    if "utf" not in _enc.lower():
+        import io
         try:
             sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
         except Exception:
