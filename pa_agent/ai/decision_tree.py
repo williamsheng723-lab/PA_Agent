@@ -486,12 +486,19 @@ def validate_gate_result_consistency(stage1: dict[str, Any]) -> list[str]:
     # Check node_id ordering: gate_trace must be in ascending chapter-section order.
     # merge_program_nodes now sorts injected nodes, but validate here to catch any
     # future regression or manually constructed traces with wrong ordering.
+    #
+    # Exception: when gate_result=wait/unknown, merge_program_nodes_head prepends
+    # program nodes so the AI's terminating node (answer=否/等待) stays at the tail.
+    # That terminal node is intentionally out of numeric order — skip the ordering
+    # check for the last node in wait/unknown traces.
     node_ids = [
         str(item.get("node_id", ""))
         for item in trace
         if isinstance(item, dict) and item.get("node_id")
     ]
-    for idx in range(1, len(node_ids)):
+    terminal_exempt = gate_result in ("wait", "unknown") and len(node_ids) > 1
+    check_up_to = len(node_ids) - 1 if terminal_exempt else len(node_ids)
+    for idx in range(1, check_up_to):
         prev_key = _gate_trace_sort_key(node_ids[idx - 1])
         curr_key = _gate_trace_sort_key(node_ids[idx])
         if curr_key < prev_key:

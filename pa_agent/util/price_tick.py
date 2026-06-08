@@ -93,9 +93,14 @@ def normalize_breakout_entry_price(
     kline_frame: Any = None,
     tick: float | None = None,
 ) -> bool:
-    """Bump entry_price to basis extreme ± 1 tick when breakout order is at/inside the bar.
+    """Force entry_price to basis extreme ± 1 tick for breakout orders.
 
-    Returns True when entry_price was adjusted.
+    Always recomputes entry_price from the cited entry_basis_bar's extreme,
+    regardless of what the AI provided. This prevents AI hallucinations where
+    the model references one bar's seq but uses price data from a different bar
+    — the entry_basis_bar is the single source of truth.
+
+    Returns True when entry_price was adjusted (or recomputed to same value).
     """
     if decision.get("order_type") != "突破单":
         return False
@@ -107,11 +112,6 @@ def normalize_breakout_entry_price(
         return False
     bar = bar_by_seq(kline_frame, basis_seq)
     if bar is None:
-        return False
-
-    try:
-        entry = float(decision.get("entry_price"))
-    except (TypeError, ValueError):
         return False
 
     direction = str(decision.get("order_direction", "") or "")
@@ -128,11 +128,12 @@ def normalize_breakout_entry_price(
     if target is None:
         return False
 
-    needs_fix = (
-        (direction == "做多" and extreme == "high" and entry <= float(bar.high))
-        or (direction == "做空" and extreme == "low" and entry >= float(bar.low))
-    )
-    if not needs_fix:
+    try:
+        current = float(decision.get("entry_price"))
+    except (TypeError, ValueError):
+        current = None
+
+    if current == target:
         return False
 
     decision["entry_price"] = target
@@ -150,5 +151,8 @@ def format_breakout_tick_hint(kline_frame: Any) -> str:
         f"`entry_price` 必须 **严格大于** `entry_basis_bar` 的 high，"
         f"推荐 `entry_price = 该 K 线 high + {tick_s}`（禁止等于 high）；"
         f"做空时 `entry_price` 必须 **严格低于** low，推荐 `low - {tick_s}`。"
-        f"`entry_rule` 只写规则说明，勿重复 order_type/方向长句。"
+        f"`entry_rule` 必须写明：`K{{n}} low/high = {{实际价格}}，entry = {{实际价格}} ± {tick_s}`，"
+        f"勿重复 order_type/方向长句。"
+        f"**程序会用 entry_basis_bar 对应棒的极点重算 entry_price，忽略你给的数值——"
+        f"请确保 entry_basis_bar 序号与你实际引用的 K 线一致。**"
     )

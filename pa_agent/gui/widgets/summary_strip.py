@@ -5,7 +5,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QFrame, QGridLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 _DEFAULT_METRICS = [
-    ("最终动作", "—"),
+    ("当前趋势", "—"),
     ("当前市场周期", "—"),
     ("下一个市场周期", "—"),
     ("支撑区", "—"),

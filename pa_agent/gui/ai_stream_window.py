@@ -239,6 +239,11 @@ class AIStreamPanel(QWidget):
             self._mode_label.setText(
                 f"API: thinking={thinking} · reasoning_effort={p.reasoning_effort} · {p.model}"
             )
+        elif "minimax.io" in base or "minimax.com" in base:
+            thinking = "adaptive" if p.thinking else "disabled"
+            self._mode_label.setText(
+                f"MiniMax: thinking={thinking} · {p.model}"
+            )
         elif "kkone.vip" in base:
             thinking = "开" if p.thinking else "关"
             self._mode_label.setText(

@@ -2972,8 +2972,17 @@ class MainWindow(QMainWindow):
                     best_key = max(probs, key=lambda k: probs[k])
                     next_cycle_zh = _cycle_map.get(best_key, best_key)
 
+                # Current trend from diagnosis_summary.direction
+                _trend_map = {
+                    "bullish": "上涨",
+                    "bearish": "下跌",
+                    "neutral": "震荡",
+                }
+                cur_trend = diag.get("direction") or ""
+                cur_trend_zh = _trend_map.get(cur_trend, cur_trend or "—")
+
                 metrics: dict[str, str] = {
-                    "最终动作": order,
+                    "当前趋势": cur_trend_zh,
                     "当前市场周期": cur_cycle_zh,
                     "下一个市场周期": next_cycle_zh,
                     "支撑区": "—",

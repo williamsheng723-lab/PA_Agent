@@ -555,7 +555,7 @@ def normalize_trace_list(
             return 999
         nid = str(item.get("node_id", ""))
         for prefix, rank in _CHAPTER_ORDER.items():
-            if nid.startswith(prefix):
+            if nid.startswith(prefix) or nid == prefix.rstrip("."):
                 return rank
         return 500  # unrecognised nodes go in the middle
 

@@ -77,6 +77,12 @@ def _is_packyapi(base_url: str) -> bool:
     return "packyapi.com" in (base_url or "").lower()
 
 
+def _is_minimax(base_url: str) -> bool:
+    """MiniMax (api.minimax.io) OpenAI-compatible gateway."""
+    url = (base_url or "").lower()
+    return "minimax.io" in url or "minimax.com" in url
+
+
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
 _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 # DeepSeek API: max_tokens must be in [1, 393216].
@@ -113,9 +119,9 @@ def _adaptive_output_effort(reasoning_effort: str | None) -> str:
 
 
 # Sent to OpenAI-compatible gateways; upstream may clamp below these values.
-_PRACTICAL_UNLIMITED_MAX_TOKENS = 999_999
+_PRACTICAL_UNLIMITED_MAX_TOKENS = 524288
 # Anthropic-style thinking requires budget_tokens < max_tokens.
-_PRACTICAL_UNLIMITED_THINKING_BUDGET = 999_998
+_PRACTICAL_UNLIMITED_THINKING_BUDGET = 524287
 
 
 def _effort_budget_tokens(effort: str | None, *, max_output: int) -> int:
@@ -188,10 +194,37 @@ def _resolve_thinking_params(
     model = settings.model or ""
 
     if _is_deepseek_native(settings.base_url):
-        extra_body: dict[str, Any] = {
-            "thinking": {"type": "enabled" if _thinking else "disabled"},
-        }
-        return extra_body, _effort if _thinking else None
+        # DeepSeek v4+ requires thinking.type=adaptive + output_config.effort;
+        # the old "enabled"/"disabled" values are no longer accepted.
+        if _thinking:
+            extra_body: dict[str, Any] = {
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": _adaptive_output_effort(_effort)},
+            }
+            return extra_body, _effort or "medium"
+        else:
+            extra_body = {
+                "thinking": {"type": "disabled"},
+            }
+            return extra_body, None
+
+    if _is_minimax(settings.base_url):
+        # MiniMax (api.minimax.io):
+        # - thinking.type only accepts "adaptive" (on) or "disabled" (off); no budget_tokens
+        # - reasoning_split=True exposes thinking via reasoning_content / reasoning_details
+        # - M2.x cannot disable thinking; "disabled" is accepted but ignored
+        if _thinking:
+            extra_body = {
+                "thinking": {"type": "adaptive"},
+                "reasoning_split": True,
+            }
+        else:
+            extra_body = {
+                "thinking": {"type": "disabled"},
+                "reasoning_split": True,
+            }
+        # MiniMax does not use reasoning_effort
+        return extra_body, None
 
     if not _thinking:
         return {}, None
@@ -327,6 +360,16 @@ class DeepSeekClient:
         msg = response.choices[0].message
         content = msg.content or ""
         reasoning_content = getattr(msg, "reasoning_content", None) or ""
+        # MiniMax with reasoning_split=True may also use reasoning_details
+        if not reasoning_content:
+            details = getattr(msg, "reasoning_details", None)
+            if details:
+                parts = []
+                for detail in details:
+                    t = detail.get("text") if isinstance(detail, dict) else getattr(detail, "text", None)
+                    if t:
+                        parts.append(t)
+                reasoning_content = "".join(parts)
 
         # Build usage
         u = response.usage
@@ -507,7 +550,17 @@ class DeepSeekClient:
 
                 # Official pattern: reasoning_content is None when absent, not ""
                 # reasoning_content arrives first (thinking phase), then content
+                # MiniMax with reasoning_split=True uses delta.reasoning_details[].text
+                # instead of delta.reasoning_content.
                 r = getattr(delta, "reasoning_content", None)
+                if not r:
+                    # MiniMax streaming: reasoning_details is a list of dicts
+                    details = getattr(delta, "reasoning_details", None)
+                    if details:
+                        for detail in details:
+                            t = detail.get("text") if isinstance(detail, dict) else getattr(detail, "text", None)
+                            if t:
+                                r = (r or "") + t
                 if r:
                     reasoning_content += r
                     if on_reasoning_token is not None:
