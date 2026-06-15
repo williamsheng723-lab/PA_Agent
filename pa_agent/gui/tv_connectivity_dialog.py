@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-TV_CLOUD_SERVER_WIKI_URL = "https://www.rainyun.com/Nzc2Njg0_"
+TV_CLOUD_SERVER_WIKI_URL = "https://my.feishu.cn/wiki/FuqnwkPwdiCLhQkPloKc7r1lntg"
 
 _MESSAGE = (
     "当前设备无法连接 TradingView 数据服务，将无法获取以下 K 线数据：\n"

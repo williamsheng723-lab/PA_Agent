@@ -16,6 +16,8 @@ _STRATEGY_FILE_ALIASES: dict[str, str] = {
     "交易区间交易策略.txt": "震荡区间交易策略.txt",
     "宽通道分析识别.txt": "文件13-窄通道与宽通道策略.txt",
     "宽通道交易策略.txt": "文件13-窄通道与宽通道策略.txt",
+    "下跌通道策略.txt": "下跌通道交易策略.txt",
+    "下跌通道策略": "下跌通道交易策略.txt",
 }
 
 _BAR_ROLE_ALIASES: dict[str, str] = {
@@ -101,6 +103,85 @@ _CONTEXT_EFFECT_ALIASES: dict[str, str] = {
     "neutral": "neutral",
     "transition": "transition",
 }
+
+_BAR_TYPE_ENUM = frozenset({
+    "trend_bull", "trend_bear", "doji", "inside",
+    "outside_bull", "outside_bear", "flat", "other",
+})
+_BAR_TYPE_ALIASES: dict[str, str] = {
+    "ine": "inside",
+    "ins": "inside",
+    "insid": "inside",
+    "doj": "doji",
+    "trendbull": "trend_bull",
+    "trendbear": "trend_bear",
+    "outsidebull": "outside_bull",
+    "outsidebear": "outside_bear",
+}
+
+
+def _strip_enum_suffix(raw: str) -> str:
+    text = raw.strip()
+    for sep in ("（", "(", "【", "[", "—", "–", " - ", "：", ":"):
+        if sep in text:
+            head = text.split(sep, 1)[0].strip()
+            if head:
+                return head
+    return text
+
+
+def _normalize_bar_type_value(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    text = _strip_enum_suffix(raw)
+    key = text.strip().lower().replace(" ", "_")
+    key = _BAR_TYPE_ALIASES.get(key, key)
+    if key in _BAR_TYPE_ENUM:
+        return key
+    for token in sorted(_BAR_TYPE_ENUM, key=len, reverse=True):
+        if key.startswith(token) or token.startswith(key):
+            return token
+    return None
+
+
+def _bar_type_from_summary(out: dict[str, Any], bar_label: str) -> str | None:
+    summary = out.get("bar_by_bar_summary")
+    if not isinstance(summary, list):
+        return None
+    target = str(bar_label or "K1").strip().upper()
+    for item in summary:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("bar", "")).strip().upper() != target:
+            continue
+        return _normalize_bar_type_value(item.get("bar_type"))
+    return None
+
+
+def _normalize_bar_types(out: dict[str, Any]) -> None:
+    """Fix truncated bar_type tokens (e.g. inside→ine) before schema validation."""
+    summary = out.get("bar_by_bar_summary")
+    if isinstance(summary, list):
+        for item in summary:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("bar_type")
+            norm = _normalize_bar_type_value(raw)
+            if norm and norm != raw:
+                item["bar_type"] = norm
+                logger.debug("Mapped bar_by_bar_summary bar_type %r -> %s", raw, norm)
+
+    bar_analysis = out.get("bar_analysis")
+    if not isinstance(bar_analysis, dict):
+        return
+    raw_bt = bar_analysis.get("bar_type")
+    norm_bt = _normalize_bar_type_value(raw_bt)
+    if norm_bt is None:
+        last_bar = str(bar_analysis.get("last_closed_bar") or "K1")
+        norm_bt = _bar_type_from_summary(out, last_bar)
+    if norm_bt and norm_bt != raw_bt:
+        bar_analysis["bar_type"] = norm_bt
+        logger.debug("Mapped bar_analysis.bar_type %r -> %s", raw_bt, norm_bt)
 
 
 def _hoist_bar_by_bar_summary(out: dict[str, Any]) -> None:
@@ -473,6 +554,7 @@ def normalize_stage1(
     normalize_stage1_traces(out, normalization_mode=normalization_mode)
     _normalize_bar_by_bar_roles(out)
     _normalize_bar_by_bar_context_effects(out)
+    _normalize_bar_types(out)
     _normalize_signal_bar_object(out)
     _normalize_signal_bar_quality(out)
     _normalize_transition_risk(out)

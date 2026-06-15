@@ -150,7 +150,11 @@ def _render_chart(bars_newest_first: list[Any], ema20_newest_first: list[float],
                   entry_price: float | None = None,
                   stop_loss_price: float | None = None,
                   take_profit_price: float | None = None,
-                  order_direction: str = "") -> bool:
+                  order_direction: str = "",
+                  order_type: str = "",
+                  diagnosis_confidence: str = "",
+                  trade_confidence: str = "",
+                  estimated_win_rate: str = "") -> bool:
     """Draw a candlestick + EMA20 chart and save to *image_path*.
 
     Returns True on success, False if matplotlib is unavailable.
@@ -253,6 +257,47 @@ def _render_chart(bars_newest_first: list[Any], ema20_newest_first: list[float],
         f"{symbol} {timeframe}  —  最近 {n} 根K线（K1=最新收盘）",
         color="#e6edf3", fontsize=10, pad=8,
     )
+
+    # ── Order type badge (top-left corner) ────────────────────────────────────
+    if order_type:
+        _ot = str(order_type).strip()
+        _ot_colors = {
+            "限价单": "#fbbf24",   # amber
+            "突破单": "#a78bfa",   # purple
+            "市价单": "#34d399",   # teal
+        }
+        _ot_color = _ot_colors.get(_ot, "#8b949e")
+        ax.text(
+            0.01, 0.97, _ot,
+            transform=ax.transAxes,
+            color=_ot_color, fontsize=9, fontweight="bold",
+            va="top", ha="left",
+            bbox=dict(facecolor="#161b22", edgecolor=_ot_color,
+                      linewidth=1.2, alpha=0.9, pad=3, boxstyle="round,pad=0.3"),
+            zorder=10,
+        )
+
+    # ── Confidence badges (top-left, right of order type) ─────────────────────
+    # Show diagnosis_confidence / trade_confidence / estimated_win_rate as a
+    # compact info row just below the order-type badge.
+    _conf_parts = []
+    if diagnosis_confidence:
+        _conf_parts.append(f"诊断置信 {diagnosis_confidence}")
+    if trade_confidence:
+        _conf_parts.append(f"交易置信 {trade_confidence}")
+    if estimated_win_rate:
+        _conf_parts.append(f"胜率 {estimated_win_rate}")
+    if _conf_parts:
+        _conf_text = "   ".join(_conf_parts)
+        ax.text(
+            0.01, 0.905, _conf_text,
+            transform=ax.transAxes,
+            color="#cbd5e1", fontsize=8,
+            va="top", ha="left",
+            bbox=dict(facecolor="#161b22", edgecolor="#30363d",
+                      linewidth=0.8, alpha=0.85, pad=3, boxstyle="round,pad=0.3"),
+            zorder=10,
+        )
 
     # ── Entry / SL / TP horizontal lines ──────────────────────────────────────
     # Determine bull/bear from order_direction for colour defaults
@@ -449,6 +494,10 @@ def _save_trade_record_impl(
                 stop_loss_price=_parse_sr_price(dec.get("stop_loss_price")),
                 take_profit_price=_parse_sr_price(dec.get("take_profit_price")),
                 order_direction=str(dec.get("order_direction") or ""),
+                order_type=str(dec.get("order_type") or ""),
+                diagnosis_confidence=str(dec.get("diagnosis_confidence") or ""),
+                trade_confidence=str(dec.get("trade_confidence") or ""),
+                estimated_win_rate=str(dec.get("estimated_win_rate") or ""),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("chart render failed: %s", exc)

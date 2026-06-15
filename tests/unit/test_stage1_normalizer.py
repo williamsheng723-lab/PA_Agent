@@ -213,6 +213,39 @@ def test_normalize_signal_bar_null_infers_from_summary() -> None:
     assert isinstance(result, Ok)
 
 
+def test_normalize_bar_type_ine_truncation_passes_schema() -> None:
+    """Regression: models truncate inside→ine in bar_analysis.bar_type."""
+    import json
+
+    from pa_agent.ai.json_validator import Ok
+
+    raw = {**VALID_STAGE1}
+    raw["bar_analysis"] = {
+        "always_in": "long",
+        "last_closed_bar": "K1",
+        "bar_type": "ine",
+        "signal_bar": {"bar": "K1", "quality": "weak", "reason": "inside回调"},
+        "entry_setup_type": "none",
+        "follow_through": "pending",
+    }
+    raw["bar_by_bar_summary"] = [
+        {
+            "bar": "K1",
+            "role": "test",
+            "bar_type": "inside",
+            "context_effect": "weakens_bull",
+            "follow_through": "pending",
+            "trapped_side": "bulls",
+            "reason": "内包阴线",
+        },
+    ]
+    out = normalize_stage1(raw)
+    assert out["bar_analysis"]["bar_type"] == "inside"
+
+    result = schema_test_validator().validate("stage1", json.dumps(out, ensure_ascii=False))
+    assert isinstance(result, Ok)
+
+
 def test_pad_bar_by_bar_summary_when_model_only_sends_five_bars() -> None:
     n = 100
     frame = KlineFrame(
