@@ -31,9 +31,11 @@ class CancelToken:
 class OrchestratorEvent(Enum):
     """Events emitted by TwoStageOrchestrator during a submission."""
     Stage1Started = auto()
+    Stage1Retry = auto()
     Stage1Done = auto()
     Stage1Failed = auto()
     Stage2Started = auto()
+    Stage2Retry = auto()
     Stage2Done = auto()
     Stage2Failed = auto()
     RecordSaved = auto()

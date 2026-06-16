@@ -238,6 +238,17 @@ class MT5Source(DataSource):
                     vol = float(rate["real_volume"])
                 except (ValueError, KeyError):
                     vol = 0.0
+
+            if i == 0:
+                # Position 0 is the newest (potentially forming) bar in MT5.
+                # Mark it as closed=False so downstream is_bar_still_forming()
+                # can do a proper wall-clock + safety-net check.
+                # (is_bar_still_forming has a 6 h safety margin for daily/weekly
+                # bars to handle stale broker server time during weekends.)
+                is_forming = True
+            else:
+                is_forming = False
+
             bars.append(
                 normalize_kline_bar(
                     KlineBar(
@@ -248,7 +259,7 @@ class MT5Source(DataSource):
                         low=float(rate["low"]),
                         close=float(rate["close"]),
                         volume=vol,
-                        closed=(i != 0),  # i=0 is the newest (forming) bar
+                        closed=not is_forming,
                     )
                 )
             )

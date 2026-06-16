@@ -62,6 +62,33 @@ _PA_TERMINOLOGY_ZH = """
 英文缩写（可保留）：SB/EB、OB/IB、H1/H2、L1/L2、MTR、AIL/AIS、20GB。
 """.strip()
 
+_STAGE2_API_TASK_RULE = """
+## 阶段二 API 任务模式（硬约束，非聊天）
+
+本次调用是 PA Agent **阶段二的一次独立 API 请求**。提示中虽含阶段一诊断 JSON，**不代表**阶段二已完成或可以收尾对话。
+
+**禁止**输出：
+- 「阶段一和阶段二都已输出完毕」「分析已完成」等会话总结
+- 「告诉我你想怎么处理」「请选择 1/2/3/4」等菜单式追问
+- Markdown 摘要、复盘建议、保存文件提示（除非写在 JSON 字段内）
+
+**必须**：在 assistant 正文 `content` 输出**完整阶段二裸 JSON**（仅此一种交付物）。
+""".strip()
+
+_OPENCLAW_AGENT_NO_TOOLS_RULE = """
+## PA Agent × QClaw 任务模式（硬约束）
+
+你正在接收 **PA Agent 程序化 K 线分析**请求，不是通用编程/运维助手会话。
+
+**禁止调用任何工具**，包括但不限于：`exec`、运行 Python/shell、读/写/编辑文件、浏览器、联网搜索、在 `~/.qclaw/workspace` 写中间 `.md`/`.json` 等。
+
+- K 线表、EMA/ATR、几何特征、阶段一诊断（若有）**已全部在用户消息中给出**；禁止再拉数据或读盘。
+- 风险点数、盈亏比、交易者方程、胜率估算等**一律在思考过程或 JSON 字段内心算**；禁止为 `risk=stop-entry` 之类简单算术启动解释器。
+- **唯一交付物**：assistant 正文 `content` 中的裸 JSON（阶段一或阶段二 schema）。不得在磁盘上留档后再回复。
+
+违反会导致分析极慢、工具刷屏，且程序无法解析你的输出。
+""".strip()
+
 _THINKING_CONTENT_OUTPUT_RULE = """
 ## 思考与正式输出分离（硬约束，违反则程序判定失败）
 
@@ -80,16 +107,44 @@ _THINKING_CONTENT_OUTPUT_RULE = """
 _STAGE1_TAIL_REMINDER = (
     "【最后一步·必做】思考结束后，立即在 assistant 正文 `content` 输出完整阶段一裸 JSON。"
     "思考请用简体中文并尽量简洁；`content` 不得为空。"
+    "禁止调用 exec/Python/写文件等工具。\n"
     "若 token 紧张：可缩短思考、将 bar_by_bar_summary 缩至 8 根，"
     "但 gate_trace 与 gate_result 必须写在 JSON 末尾且不可省略。"
 ).strip()
 
+_INCREMENTAL_OUTPUT_HARD_RULES = """
+## 增量输出格式（硬约束，违反则程序自动重试）
+
+本次是**程序自动分析**，不是人机聊天。assistant 正文 `content` **只能**是完整阶段一裸 JSON（以 `{` 开头、以 `}` 结尾）。
+
+**禁止**在 `content` 里输出：
+- Markdown 标题（`##`）、表格、项目符号摘要、emoji
+- 「诊断已更新完毕」「如需进入阶段二」「随时告诉我」等对话用语
+- 「诊断更新摘要」「主要更新字段」类 executive summary（变化说明应写在 JSON 的 `incremental_delta.summary`、`risk_warning`、`gate_trace` 等字段内）
+- ` ```json ` 代码围栏或任何 markdown 围栏
+
+**必须**：输出与全量阶段一相同 schema 的**完整** JSON（含 `incremental_delta`），不是差异补丁或文字版变更说明。
+""".strip()
+
 _STAGE2_TAIL_REMINDER = (
     "【最后一步·必做】思考结束后，立即在 assistant 正文 `content` 输出完整阶段二裸 JSON"
     "（含 decision、decision_trace、terminal）。思考用简体中文并尽量简洁；`content` 不得为空。"
+    "禁止调用 exec/Python/写文件等工具；算术在 JSON 推理字段内完成。\n"
     "若 token 紧张，优先保证 `content` 有 JSON，可缩短思考。\n"
     "⚠️ 禁止在 content 中只写思考过程或分隔符（如 ---输出JSON---）而不附 JSON——"
-    "这会导致校验直接失败。哪怕只输出最小骨架 {\"decision\":{\"order_type\":\"不下单\",...}} 也比没有强。"
+    "这会导致校验直接失败。哪怕只输出最小骨架 {\"decision\":{\"order_type\":\"不下单\",...}} 也比没有强。\n\n"
+    "【⚠️ 输出前自检 — terminal.outcome 语义规则（在输出 JSON 前逐项确认）：】\n"
+    "1. §9.0 和 §10.1 是否都是「否/等待/不适用」？→ 如果是，你根本没有入场方案，\n"
+    "   terminal.outcome **只能是 wait**，terminal.node_id 填最早否定节点（如 \"9.0\"）。\n"
+    "   **例外**：宽通道/区间/通道靠边界、可挂计划型限价单且三价+10.3 可评估时，"
+    "§9.0 应判「是」（非否），继续 §10 而非直接 wait。\n"
+    "   禁止写 reject — 你没有东西可以拒绝。\n"
+    "2. 你有入场方案（entry/stop/target 三价齐全），但 10.3 交易者方程不通过？\n"
+    "   → 这才可以写 terminal.outcome=reject，node_id=\"10.3\"。\n"
+    "3. 你有入场方案且 10.3 通过？→ terminal.outcome=trade，node_id 为最终节点。\n"
+    "   **禁止**写 action/execute/entry 等自创词，只能是 wait|reject|trade|proceed。\n"
+    "4. 限价/突破尚未触发？→ entry_bar.freshness=pending（禁止 limit_order_pending 等自创词）。\n"
+    "常见错误速查：§9.0=否 + §10.1=否 → outcome=wait（不是 reject！）"
 ).strip()
 
 # ── Hardcoded output format reminders ─────────────────────────────────────────
@@ -114,6 +169,8 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
   "key_signals": [],
   "htf_context": "",
   "entry_setup": "",
+  "support_levels": ["5402", "5119"],
+  "resistance_levels": ["6147", "6300"],
   "strategy_files_needed": ["下跌通道分析识别.txt", "下跌通道交易策略.txt"],
   "risk_warning": "",
   "bar_analysis": {
@@ -121,7 +178,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
     "last_closed_bar": "K1",
     "bar_type": "trend_bull|trend_bear|doji|inside|outside_bull|outside_bear|flat|other",
     "signal_bar": {
-      "bar": "K2",
+      "bar": "K2 或 null（无独立信号棒时填 null，禁止整个 signal_bar 为 null）",
       "quality": "strong|medium|weak|invalid",
       "reason": "信号棒质量判断"
     },
@@ -203,11 +260,13 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 
 规则：
 - answer 只能是：是 / 否 / 中性 / 等待 / 不适用（**禁止**写「部分」「待确认」「待定」等——部分一致用 **中性**，尚需下一根K线确认用 **等待**）
+- **gate_result=wait/unknown 的合法触发条件只有两个：§1.2 answer≠是（无法识别周期）或 §1.3 answer=否（极端混乱 extreme_tr）。** §6/§9/§10 等后续节点的"否"答案（信号不一致、止损无法设定、交易者方程不通）不代表闸门阻断——这些是阶段二的判断依据
 - 任一闸门导致「等待/unknown」时，gate_result 设为 wait 或 unknown，并在最后一条 trace 写明 reason
 - gate_result=proceed 表示可通过闸门进入阶段二；wait/unknown 表示不应进入策略与下单评估
 - gate_trace 与 cycle_position、direction 不得矛盾
 - 每条 gate_trace.reason 须非空且说明依据（勿只写「通过」「是」等套话）
 - gate_result=proceed 时，**最后一条** gate_trace.reason 须含「闸门通过」或「进入阶段二」
+- **禁止在 gate_trace 中输出 node_id 为 "14.1" 的节点**：14.1（禁止行为扫描）由程序自动注入，AI 输出会导致重复节点和校验失败
 - 节点 2.4 / 2.5 的 question 须与决策树原文一致（含 Always In 空格、用「支持」而非仅改措辞）
 
 **每条 gate_trace / decision_trace 必须包含 bar_range（K线依据，由你自行判断）：**
@@ -229,12 +288,18 @@ diagnosis_confidence 必须为 0-100 的整数(满分100),表示对 cycle_positi
 禁止使用 high、medium、low 等字符串;分数越高表示对当前市场状态判断越有把握。
 
 diagnosis_confidence 分档说明:
-- 90-100:周期位置非常典型,K线特征完全匹配频谱定义,多时间框架方向一致,信号充分无矛盾
+- 90-100:周期位置非常典型,K线特征完全匹配频谱定义,长程背景与近期结构同向共振,信号充分无矛盾
 - 70-89:周期位置较明确,主要特征吻合频谱定义,可能有个别模糊信号但不影响核心判断
-- 50-69:周期位置存在歧义(如 trending_tr vs normal_channel),信号部分矛盾,需更多K线确认;市场可能处于过渡阶段
+- 50-69:周期位置存在歧义(如 trending_tr vs normal_channel),或长程背景与近期方向冲突(冲突不否决、不自动wait,仅降置信);需更多K线确认
 - 30-49:信号严重矛盾,周期位置难以判定,K线特征与多种状态都有部分重叠
 - 0-29:数据不足以支撑任何诊断,或市场状态极度混乱(如极端交易区间)
-""".strip()
+
+**support_levels / resistance_levels 填写规则：**
+- `support_levels`：从近期 K 线结构中识别出的**当前价格下方**支撑价位，按由近到远排列，最多 3 个。每项填价格字符串（如 `"5402"` 或 `"5380-5400"` 表示区间），不识别时填空数组 `[]`。
+- `resistance_levels`：从近期 K 线结构中识别出的**当前价格上方**阻力价位，按由近到远排列，最多 3 个。格式同上，不识别时填空数组 `[]`。
+- **突破后必须更新**：若 K1 收盘已跌破原支撑（支撑价位 ≥ 收盘价），该支撑不得继续保留，应改填**当前收盘价下方**最近的有效摆动低点/结构位；若 K1 收盘已突破原阻力（阻力价位 ≤ 收盘价），该阻力不得继续保留，应改填**当前收盘价上方**最近的有效摆动高点/结构位。增量分析时禁止照抄上一轮 support/resistance。
+- 填写依据：近期摆动高低点、通道边界、EMA、前期整数关口、突破/失败突破位。**禁止**填写远离当前价格超过长程结构窗口波动幅度的历史高低点。
+- 若市场处于 `extreme_tr` 或无法识别周期，允许填 `[]`。""".strip()
 
 _STAGE2_OUTPUT_CONTRACT = """
 请严格按照以下 JSON 格式输出决策结果，不要输出任何其他内容。
@@ -247,7 +312,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 ```json
 {
   "decision": {
-    "order_direction": "做多|做空|null",
+    "order_direction": "做多|做空|null（禁止写 bearish/bullish/short/long）",
     "order_type": "限价单|突破单|市价单|不下单",
     "entry_price": null,
     "entry_basis_bar": null,
@@ -290,7 +355,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
     },
     "second_entry": {
       "is_second_entry": true,
-      "type": "H2|L2|MTR|wedge|tr_boundary|trendline|none"
+      "type": "H2|L2|MTR|wedge|tr_boundary|trendline|none（is_second_entry=false 时必须填 none，禁止 null）"
     }
   },
   "decision_trace": [
@@ -369,11 +434,55 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 - `decision_trace[10.3].reason` 中的入场/止损/目标数字必须与 `decision` 三价一致（勿用未写入 decision 的中间价）
 - 做多：风险点数 = entry − stop，回报点数 = take_profit − entry；做空：风险 = stop − entry，回报 = entry − take_profit
 - 盈亏比 = 回报 ÷ 风险（程序与界面只认此公式；reasoning 中写的 RR 必须与三价一致，否则校验失败）
-- 有下单时：盈亏比不得低于当前交易倾向的底线（保守≥1.5，均衡≥1.2，激进/极度激进≥1.0），且须满足 **胜率%×回报 > (100−胜率)%×风险**
+- **盈亏比上限（硬规则）**：有下单时盈亏比 **不得高于 1.5:1**（回报÷风险 ≤ 1.5）。目标位过远会压低可实现胜率，程序会拒单。优先选最近的**有效结构目标**，但不得把 K1 区间内部、EMA 附近噪音、或仅为满足 RR 的近点位当作有效止盈。
+- 有下单时：盈亏比须在 **1.0–1.5** 区间内（各交易倾向相同；回报÷风险 ≥ 1.0 且 ≤ 1.5），且须满足 **胜率%×回报 > (100−胜率)%×风险**（数学期望为正）
 - 不满足上述任一条 → **10.3 必须判「否」**，order_type=**不下单**，不得输出限价/突破/市价单
 - **10.3 通过之前**不得输出具体下单类型；**10.3 之后**才写 §11
 - 因方程不通过而放弃：terminal.node_id 应为 **10.3**，outcome=reject 或 wait
 - 完成 10.3 后，必须把你在方程中使用的**胜率主观估计**写入 decision.estimated_win_rate（0–100 整数），并在 estimated_win_rate_reasoning 简要说明依据；**禁止**留空或仅从 trace 文字里暗示
+
+**结构型止损 / 止盈质量规则（防止噪音内小单）：**
+- `stop_loss_price` 必须放在「本笔交易假设真正失效」的结构位之外，而不是为了通过 10.3 方程而贴近 EMA、K1 low/high、整数位或单根 K 线内部噪音。
+- 若止损只是在 EMA / 支撑 / 阻力外侧很近的位置，且没有越过明确 swing low/high、信号棒极点、通道边界失效位或区间边界失效位，则视为「噪音内止损」；§10.1 或 §10.2 应判「否」。
+- `take_profit_price` 不应放在当前 K1 区间内部、最近噪音位、或仅为满足 1.0–1.5R 而选择的微小目标；除非该点位本身是明确反向结构边界，否则应选择下一层有效阻力 / 支撑 / 通道边界。
+- 若使用更合理的结构止损后，最近有效结构目标导致 RR < 1.0，或为了满足 ≤1.5R 只能把目标放到噪音内，则不得缩窄 stop/target 来凑方程，应 `order_type=不下单`，terminal 指向 10.3 或更早失败节点。
+- 计划型限价单只有在「结构失效位」和「目标结构位」都清晰时才可执行；宽通道 / 区间边界 setup 只是允许进入评估，不代表必须下单。
+
+**低质量计划型限价降级规则（边际正期望 ≠ 必须下单）：**
+- 当 `signal_bar.bar=null` 或 `entry_bar.freshness=pending`（计划型限价尚未触发）时，若同时满足以下任意两项，应优先 `order_type=不下单`、terminal=wait，而不是强行给限价单：①阶段一 `direction=neutral`；②`transition_risk=medium/high`；③`diagnosis_confidence < 50`；④你给出的 `trade_confidence <= 50`；⑤K1 为 doji/inside/弱棒且无跟随；⑥10.3 只是「边际通过」（胜率或期望优势很小）。
+- 对计划型限价，10.3 的数学正期望只是最低门槛，不是下单理由。必须另有**清晰结构优势**（如二次入场、明确边界反转、失败突破后的反向确认、或强跟随棒确认）。若优势主要来自「小止损 + 小目标 + 主观胜率略高」，应等待。
+- 阶段一 `direction=neutral` 时，阶段二可以补充方向用于评估边界 setup，但补方向后若没有强结构确认，不能把 neutral 直接升级成可交易趋势；应把计划写入 `watch_points`，等待下一根确认 K 线。
+- `trade_confidence <= 50` 的交易方案默认不应执行；除非 reasoning 明确说明为什么在低置信下仍有非边际结构优势，否则 `order_type=不下单`。
+
+**突破单不可用时的限价单备选路径（重要）：**
+- 当通道/趋势结构默认倾向突破单，但**当前没有合格突破入场**（信号棒失效、无跟随、极点不清晰、无法填写 entry_basis_bar/extreme、突破已错过等）时，**不要直接输出「不下单」**。
+- 若结构方向仍清晰，且能在**支撑/阻力/通道边界/EMA/前棒极点**附近设定限价 entry，并能给出清晰的**结构失效止损**与**有效结构目标**，且 **10.3 交易者方程可通过（数学期望为正）** → **应尝试 `order_type=限价单`**。
+- 限价备选典型场景：顺势回撤到结构位做多/做空、区间边界反弹/回落、宽通道靠边界挂单、突破测试失败后的反向结构位。
+- 限价单 `entry_basis_*` 可填 null；`signal_bar.bar` 可为 null（quality=invalid），须在 9.0 说明「计划型限价，等待回撤/反弹到位」；`entry_bar` 设 not_triggered/pending。
+- 仅当**突破与限价两种路径均无法**给出满足 §10.1–10.3 的三价方案时，才 `order_type=不下单`。
+
+**§9.0 计划型限价（宽通道/区间/通道边界 — 重要，勿与「无信号=观望」混淆）：**
+- §9.0 问的是「**当前是否已有可执行的入场依据**」，不是「K1 是否完美」。
+- 当 cycle_position 为 **broad_channel / trading_range / normal_channel / trending_tr**，且价格靠近 **支撑/阻力/通道边界**（阶段一 support_levels/resistance_levels），或顺势 **回撤/反弹到结构位** 可挂限价时：
+  - **§9.0 应判「是」**，reason 写明「计划型限价，等待回撤/反弹到位」；
+  - `signal_bar.bar` 可为 **null**，`quality=invalid` 或 **weak**（边界/setup 型 weak 可接受）；
+  - `entry_bar` 设 `strength=not_triggered`、`freshness=pending`；
+  - 继续 §10 定三价 → 10.3 通过 → `order_type=限价单`。
+- **禁止**因 K1 为 doji/弱棒/无跟随，就将 §9.0 判「否」后直接 `不下单`——应先尝试限价路径。
+- **仍应 §9.0=否/等待的情况**：区间/通道 **中部**（6.3 branch=middle）、无结构锚点定 stop、K1 已穿过计划 entry/stop、或 §14 触犯。
+- **direction=neutral 时**：边界 setup 仍可用计划型限价；阶段二在 diagnosis_summary 中补充 bullish/bearish（校验允许，无需强制 2.3 节点）；**禁止**仅因阶段一方向不明就 §9.0=否。
+
+**限价单 K1 新鲜度硬规则（程序会按 K 线表数值校验，违反则强制不下单）：**
+- 限价单表示**尚未成交**的挂单；必须用 **K1（最新已收盘棒）** 的 high/low/close 与三价对照，禁止用更早 K 线或「记忆中」的旧价位。
+- **做空限价单**（等待反弹到 entry 卖出，tp < entry < stop）：
+  - K1.high **必须低于** entry_price（尚未触达挂单价）；若 K1.high ≥ entry → 挂单已失效，改 `不下单` 或在 watch_points 写更高 re-entry，**禁止**原样输出。
+  - K1.close **不得高于** entry_price（收盘已在挂单价之上 = 卖单挂在市场价下方，无效）。
+  - K1.high **不得触及** stop_loss_price；若 K1.high ≥ stop → 方案无效，必须 `不下单`。
+- **做多限价单**（等待回撤到 entry 买入，stop < entry < tp）：
+  - K1.low **必须高于** entry_price；若 K1.low ≤ entry → 挂单已失效。
+  - K1.close **不得低于** entry_price。
+  - K1.low **不得触及** stop_loss_price。
+- 若 K1 已穿过 entry/stop，不得用「等下一根回撤」糊弄——应 `order_type=不下单`，terminal=wait，在 watch_points 写明重新定价条件。
 
 **突破单 entry_price 硬规则（程序会按 K 线表小数位推断最小跳动并校验）：**
 - order_type="突破单" 时，必须填写 decision.entry_basis_bar、decision.entry_basis_extreme、decision.entry_rule。
@@ -387,10 +496,12 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 
 **§9 逐K信号链与新鲜度硬规则：**
 - §9.0–§9.7 必须引用 `bar_analysis.signal_bar.bar` 与阶段一 `bar_by_bar_summary` 中的对应 K 线；只有在“计划型限价/突破挂单，尚无已收盘信号棒”时，`signal_bar.bar` 才可为 null，且必须设 `quality="invalid"`、`pattern="none"`，并在 9.0 写明“等待信号确认/接受该瑕疵”。若限价单/突破单尚未触发，`bar_analysis.entry_bar.bar` 可为 null，但必须设 `strength="not_triggered"`、`freshness="pending"`，并在 9.7 写明“等待触发，尚无入场棒”。
+- **⚠️ 市价单 entry_bar 硬规则**：`order_type="市价单"` 代表基于当前已收盘棒立即入场，**不存在「等待触发」状态**。`entry_bar.bar` 必须填写信号棒（通常为 K1），`strength` 设为 `strong` 或 `weak`，`freshness` 设为 `fresh`，`follow_through` 设为 `true`。**禁止**市价单将 `entry_bar.bar` 填为 null 或将 `freshness` 填为 `pending`——这会导致校验失败。
 - 信号棒、入场棒、确认棒必须时间顺序合理：信号棒序号通常大于入场棒序号（更早），入场棒之后的跟随看更新的 K 线。
 - 如果信号棒之后已经出现 2–3 根无跟随、反向强 K、或 `entry_bar.freshness=stale|invalid`，不得继续把旧信号当作新的突破单依据。
-- 如果最新 K1 是 doji、弱入场棒、无跟随或反向确认，必须降低 trade_confidence；除非有非常明确的二次入场/突破测试证据，否则 order_type=不下单。
+- 如果最新 K1 是 doji、弱入场棒、无跟随或反向确认，必须降低 trade_confidence；除非有非常明确的二次入场/突破测试证据，或 **计划型限价边界 setup（§9.0=是）**，否则 order_type=不下单。
 - 当 `bar_analysis.signal_bar.quality=weak|invalid`，或已触发入场棒但 `entry_bar.follow_through=false` 时，若仍下单，必须在 §9 和 reasoning 中明确说明为何该弱点未使信号失效；否则应等待。挂单未触发时不得把 `follow_through=false` 当作失败跟随，应写 `pending`。
+- **计划型限价单**：quality=weak|invalid 且 entry_bar 为 pending 时，**不视为**必须观望；须在 §9.0 判「是」并说明结构位/setup 依据。
 
 **⚠️ watch_points 与 stage1 risk_warning 一致性规则（必须遵守）：**
 - 阶段一 `risk_warning` 是风险警示，**watch_points 中的触发条件不得与其直接矛盾**。
@@ -411,6 +522,7 @@ terminal 必须与 order_type 一致（**decision 与 decision_trace 同步**）
 - 有下单 → outcome=trade，10.3 必须为「是」，decision 含有效三价
 - 不下单 → outcome=wait 或 reject，order_type=不下单，三价与 order_direction 均为 null
 - **禁止** decision 写突破单/限价单/市价单，同时 decision_trace 里 10.3=否 或 terminal=reject
+- **§14 是禁止行为扫描，不是成交终局节点**：若 §14 answer=否（未触犯）且有下单，terminal.node_id 应填最终 §11 下单节点（如 `11.2`/`11.3`）或 `10.3`，**禁止**填 `14`/`14.1`；只有 §14 answer=是（触犯）时才可作为拒绝/等待的终止原因，且必须 `order_type=不下单`。
 
 **⚠️ terminal.node_id 和 outcome 的语义规则（必须区分以下两种情形）：**
 
@@ -456,6 +568,37 @@ trade_confidence_reasoning：必须简要说明打分依据（如“入场信号
 estimated_win_rate_reasoning：必须简要说明依据（如“宽通道顺势 Low1，结构支持约 45–50%，取 47% 用于方程”）
 """.strip()
 
+# ── Analysis-mode–aware Stage 1 output rule ───────────────────────────────────
+
+_STAGE1_ORIGINAL_MODE_GATE_RULE = """
+## 原始分析过程闸门硬规则（覆盖上文任何相反描述）
+
+- 当前为 **原始分析过程**：不要使用「程序已经判定 / 由程序填充 / AI 不输出」作为省略 gate_trace 节点的理由。
+- 即使你在思考中认为某个节点已被程序预判，最终 JSON 仍必须在 `gate_trace` 中显式写出该节点。
+- 当 `gate_result="proceed"` 时，`gate_trace` 必须至少包含以下节点，且每个节点都要有独立的 `question`、`answer`、`reason`、`bar_range`：
+  `0.1`、`0.2`、`1.1`、`1.2`、`1.3`、`2.1`、`2.2`、`2.3`、`2.4`、`2.5`。
+- `0.1`/`0.2` 是阶段一前置可读性与继续分析条件闸门；`1.1` 是数据是否足够；`2.3` 是方向；`2.4` 是 Always In。原始模式必须由你自己写入 `gate_trace`。
+- 不要在 `gate_trace` 中跳过 `0.1`、`0.2`、`1.1`、`2.3`、`2.4`；否则校验会失败，阶段二不会执行。
+- **禁止在 gate_trace 中输出 node_id 为 "14.1" 的节点**：14.1（禁止行为扫描）由程序自动注入，无需 AI 输出；额外输出会导致重复节点和校验失败。
+""".strip()
+
+
+def _stage1_output_reminder_for_mode(analysis_mode: str = "original") -> str:
+    """Return Stage 1 output rules adjusted for the selected analysis mode.
+
+    - ``original``: appends a hard-rule block requiring the AI to write ALL
+      gate_trace nodes explicitly (including 0.1/0.2/1.1/2.3/2.4 which are
+      normally program-prefilled). Also disables the program prefill hint so
+      the AI reasons independently.
+    - ``optimized``: returns the standard reminder unchanged (program prefill
+      path stays active).
+    """
+    mode = (analysis_mode or "original").strip().lower()
+    if mode == "optimized":
+        return _STAGE1_OUTPUT_REMINDER
+    return _STAGE1_OUTPUT_REMINDER + "\n\n" + _STAGE1_ORIGINAL_MODE_GATE_RULE
+
+
 _NEXT_BAR_PREDICTION_INSTRUCTION = """\
 ## 下一根K线预测任务（阶段二附加输出，不影响下单决策）
 
@@ -486,6 +629,25 @@ _NEXT_BAR_PREDICTION_INSTRUCTION = """\
    设 unpredictable=true，direction=null，probabilities=null，reasoning 写明原因。
 6. 此预测**不**进入交易者方程、**不**改变 decision 中任意字段，仅作辅助参考。
 """.strip()
+
+_NEXT_BAR_DISABLED_NOTE = """\
+## 下根K线预测（用户已关闭，程序处理）
+
+用户已关闭「下根K线预期」功能以节省 token：**你无需在 JSON 中输出 `next_bar_prediction`**。
+程序校验时会自动补全占位字段；请把篇幅集中在 decision / decision_trace / terminal /
+`next_cycle_prediction` 上，勿因缺少 `next_bar_prediction` 反复重试。
+""".strip()
+
+
+def _build_next_cycle_prediction_instruction(*, enable_next_bar: bool) -> str:
+    """Return next-cycle instruction; avoid referencing next_bar when that feature is off."""
+    if enable_next_bar:
+        return _NEXT_CYCLE_PREDICTION_INSTRUCTION
+    return _NEXT_CYCLE_PREDICTION_INSTRUCTION.replace(
+        "完成 next_bar_prediction 后，必须在阶段二 JSON 顶层追加键 `next_cycle_prediction`，",
+        "必须在阶段二 JSON 顶层追加键 `next_cycle_prediction`，",
+    )
+
 
 _NEXT_CYCLE_PREDICTION_INSTRUCTION = """\
 ## 下一个市场周期预测任务（阶段二附加输出，不影响下单决策）
@@ -718,13 +880,23 @@ class PromptAssembler:
 
     def _build_stage1_system_prompt_inner(self) -> str:
         """Stage 1 system: persona + gate-only decision tree (§0–§2)."""
-        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
+        system_parts = [
+            _LANGUAGE_ZH_RULE,
+            _PA_TERMINOLOGY_ZH,
+            _OPENCLAW_AGENT_NO_TOOLS_RULE,
+            _THINKING_CONTENT_OUTPUT_RULE,
+        ]
         system_parts.extend(self._load(name) for name in COMMON_SYSTEM_STAGE1_TXT_FILES)
         return "\n\n---\n\n".join(p for p in system_parts if p)
 
     def _build_stage2_system_prompt_inner(self) -> str:
         """Stage 2 system: persona + full decision tree."""
-        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
+        system_parts = [
+            _LANGUAGE_ZH_RULE,
+            _PA_TERMINOLOGY_ZH,
+            _OPENCLAW_AGENT_NO_TOOLS_RULE,
+            _THINKING_CONTENT_OUTPUT_RULE,
+        ]
         system_parts.extend(self._load(name) for name in COMMON_SYSTEM_STAGE2_TXT_FILES)
         return "\n\n---\n\n".join(p for p in system_parts if p)
 
@@ -796,21 +968,47 @@ class PromptAssembler:
 
     # ── Stage 1 ───────────────────────────────────────────────────────────────
 
-    def build_stage1(self, frame: KlineFrame) -> list[dict]:
+    def build_stage1(self, frame: KlineFrame, *, analysis_mode: str = "original") -> list[dict]:
         """Build the message list for Stage 1 (market diagnosis)."""
         system_content = self._build_stage1_system_prompt()
-        user_content = self._build_stage1_user_prompt(frame)
+        user_content = self._build_stage1_user_prompt(frame, analysis_mode=analysis_mode)
 
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},
         ]
 
+    @staticmethod
+    def _normalize_prev_stage1_assistant_for_incremental(
+        previous_record: AnalysisRecord,
+        raw_content: str,
+    ) -> str:
+        """Use validated diagnosis JSON in incremental context, not prose/markdown replies."""
+        from pa_agent.ai.json_validator import format_model_json_for_context
+
+        diag = getattr(previous_record, "stage1_diagnosis", None) or {}
+        if isinstance(diag, dict) and diag:
+            return json.dumps(diag, ensure_ascii=False, indent=2)
+
+        formatted = format_model_json_for_context(raw_content)
+        if formatted:
+            return formatted
+
+        logger.warning(
+            "incremental stage1: could not normalize previous assistant to JSON; "
+            "using raw stage1_response content (%d chars)",
+            len(raw_content or ""),
+        )
+        return raw_content
+
     def build_incremental_stage1(
         self,
         frame: KlineFrame,
         previous_record: AnalysisRecord,
         new_bar_count: int,
+        *,
+        analysis_mode: str = "original",
+        provider_settings: Any | None = None,
     ) -> list[dict]:
         """Build Stage 1 as a continuation-based incremental update.
 
@@ -848,7 +1046,10 @@ class PromptAssembler:
                 f"roles={[m.get('role') for m in prev_s1_messages]}. "
                 f"record.meta: {getattr(previous_record, 'meta', '<missing>')!r}"
             )
-        if not prev_assistant_content:
+        prev_diag = getattr(previous_record, "stage1_diagnosis", None) or {}
+        if not prev_assistant_content and not (
+            isinstance(prev_diag, dict) and prev_diag
+        ):
             raise ValueError(
                 f"build_incremental_stage1: previous_record.stage1_response "
                 f"has no 'content' field. "
@@ -857,17 +1058,45 @@ class PromptAssembler:
                 f"record.meta: {getattr(previous_record, 'meta', '<missing>')!r}"
             )
 
+        prev_assistant_content = self._normalize_prev_stage1_assistant_for_incremental(
+            previous_record,
+            prev_assistant_content,
+        )
+
+        prev_reasoning = ""
+        if isinstance(prev_s1_response, dict):
+            prev_reasoning = str(prev_s1_response.get("reasoning_content") or "")
+        preserve_mimo = False
+        if provider_settings is not None:
+            from pa_agent.ai.mimo_compat import (
+                build_assistant_api_message,
+                is_mimo_provider,
+            )
+
+            preserve_mimo = is_mimo_provider(
+                getattr(provider_settings, "base_url", ""),
+                getattr(provider_settings, "model", ""),
+            )
+        if preserve_mimo:
+            assistant_turn = build_assistant_api_message(
+                prev_assistant_content,
+                reasoning_content=prev_reasoning,
+            )
+        else:
+            assistant_turn = {"role": "assistant", "content": prev_assistant_content}
+
         system_content = self._build_stage1_system_prompt()
         incremental_user_content = self._build_incremental_stage1_continuation_user_prompt(
             frame,
             previous_record,
             new_bar_count,
+            analysis_mode=analysis_mode,
         )
 
         return [
             {"role": "system",    "content": system_content},
             {"role": "user",      "content": prev_user_content},
-            {"role": "assistant", "content": prev_assistant_content},
+            assistant_turn,
             {"role": "user",      "content": incremental_user_content},
         ]
 
@@ -900,7 +1129,10 @@ class PromptAssembler:
                 judge_direction,
                 judge_always_in,
             )
-            import copy
+            from pa_agent.ai.trend_context import (
+                build_trend_context,
+                render_three_window_summary,
+            )
 
             hint_lines: list[str] = [
                 "## 程序预填充节点判断依据（§1.1 / §2.3 / §2.4，供 AI 参考）",
@@ -918,6 +1150,21 @@ class PromptAssembler:
 
             # §2.3
             direction, fill_23 = judge_direction(frame)
+            trend_ctx = build_trend_context(frame, direction)
+            n_bars_hint = len(frame.bars)
+            hint_lines.append(render_three_window_summary(frame, trend_ctx))
+            hint_lines.append("")
+            hint_lines.append(
+                "**§2.2 长程背景 vs 近期方向（程序摘要，供 gate_trace 2.2 引用）**"
+            )
+            hint_lines.append(
+                f"  背景方向（K{n_bars_hint}-K41）≈ {trend_ctx['background_direction']}；"
+                f"交易主方向（近期）≈ {trend_ctx['trading_direction']}；"
+                f"关系={trend_ctx['relationship']}"
+                + ("；**冲突时不否决近期、不自动减半仓位**" if trend_ctx.get("conflict") else "")
+            )
+            hint_lines.append("")
+
             hint_lines.append(
                 f"**§2.3 当前方向（多/空/中性）** → {fill_23.answer}"
                 + (f"（branch={fill_23.branch}）" if fill_23.branch else "")
@@ -937,9 +1184,8 @@ class PromptAssembler:
             hint_lines.append(
                 "⚠️ §1.1 为锁定节点不可覆盖。§2.3/§2.4 可通过 node_overrides 覆盖，"
                 "但门槛较高：\n"
-                "  • §2.3 覆盖须指明具体 K 线序号+结构特征，且该特征超出三信号（EMA斜率/收盘重心/波段枢轴）的计算范围；\n"
-                "  • §2.4 覆盖须先确认 reason 中是否已出现短窗口背离预警（⚠️标记），"
-                "并给出具体背离数据（几根中几根收盘偏向反方向）及推翻全窗口判定的理由；\n"
+                "  • §2.3 覆盖须指明具体 K 线序号+结构特征，且该特征超出五信号投票的计算范围；\n"
+                "  • §2.4 近端K8-K1为主判、背景K20-K1仅参考；覆盖须基于近端结构突变证据；\n"
                 "  • override_reason 必须具体，不接受「整体看跌」「感觉已变」等模糊描述。"
             )
             return "\n".join(hint_lines)
@@ -947,14 +1193,17 @@ class PromptAssembler:
             logger.warning("_render_program_prefill_hint failed: %s", exc)
             return ""
 
-    def _build_stage1_user_prompt(self, frame: KlineFrame) -> str:
+    def _build_stage1_user_prompt(self, frame: KlineFrame, *, analysis_mode: str = "original") -> str:
         """Build the Stage 1 task turn; stage-specific rules stay out of system."""
         pattern_block = self._stage1_pattern_supplement()
-        prefill_hint = self._render_program_prefill_hint(frame)
+        # In original mode the AI must reason independently — do NOT inject the
+        # program prefill hint, as it would prime the model to skip those nodes.
+        use_prefill = (analysis_mode or "original").strip().lower() == "optimized"
+        prefill_hint = self._render_program_prefill_hint(frame) if use_prefill else ""
         stage1_parts = [
             *(self._load(name) for name in STAGE1_TASK_PROMPT_TXT_FILES),
             *([pattern_block] if pattern_block else []),
-            _STAGE1_OUTPUT_REMINDER,
+            _stage1_output_reminder_for_mode(analysis_mode),
         ]
         stage1_context = "\n\n---\n\n".join(p for p in stage1_parts if p)
         kline_table = self._render_kline_table(frame)
@@ -971,21 +1220,18 @@ class PromptAssembler:
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
             f"## ⚠️ 分析窗口分层规则（强制，必须遵守）\n\n"
             f"你收到全部 {n_bars} 根 K 线数据，但分析深度必须严格分层：\n\n"
-            f"**详细分析区 K1–K40（最近约 10 小时）：**\n"
-            f"- bar_by_bar_summary 覆盖此区间\n"
-            f"- 通道/波段/趋势结构识别、信号棒识别、趋势棒计数、反转判断\n"
-            f"- market_phase 和 cycle_position 判断基于**此区间**的结构特征\n"
-            f"- 各闸门节点的 bar_range 优先选取此区间\n\n"
-            f"**结构背景区 K41–K{n_bars}（更早期）：**\n"
-            f"- **只提取重要的 swing highs/lows（波段高点和低点）**\n"
-            f"- 将这些关键价位写入 `htf_context` 字段，格式示例：\n"
-            f"  「K65 高点 2685、K80 低点 2632、K92 高点 2698」\n"
-            f"- **禁止** 对 K41–K{n_bars} 做逐棒分析、通道识别、趋势结构、信号判断\n"
-            f"- **禁止** 在 bar_by_bar_summary 中涵盖 K41 及更早的 K 线\n"
-            f"- **禁止** 用 K41–K{n_bars} 的结构判断大时间框架（HTF）方向——"
-            f"其作用仅限于提供价格水平参考（潜在的支撑/阻力/磁力位）\n"
-            f"- K41–K{n_bars} 的高低价位只在 node 2.2 中作为**次要参考**，"
-            f"不作为 HTF 方向的否决依据\n\n"
+            f"**即时惯性区 K1–K8（Brooks：市场继续做刚刚在做的事）：**\n"
+            f"- bar_by_bar_summary **必须**覆盖 K8–K1 每一根\n"
+            f"- spike_stage / 尖峰识别、§2.5 惯性强度优先看此窗口\n"
+            f"- cycle_position 若为 spike，结构依据必须来自此窗口\n\n"
+            f"**近期结构区 K1–K40：**\n"
+            f"- 通道/波段/趋势结构、信号棒、反转判断的主窗口\n"
+            f"- `direction` 与交易主方向以此为准（程序 §2.3 亦用近端窗口）\n"
+            f"- 各闸门 bar_range 优先选取此区间\n\n"
+            f"**长程背景区 K41–K{n_bars}（全部数据中较老部分，不截断）：**\n"
+            f"- 提取 swing highs/lows 写入 `htf_context`，作磁力位/阻力支撑参考\n"
+            f"- **禁止**用长程方向否决近期方向（Brooks：近期或主要任一同向即顺势）\n"
+            f"- node 2.2 记录背景与近期的关系（同向/冲突），冲突时近期为主\n\n"
             f"## K线数据(序号1=最新已收盘K线,序号越大越早;不含当前未收盘K线;"
             f"阳阴列由程序按收盘价与开盘价计算:收盘>开盘=阳线,收盘<开盘=阴线,相等=平)\n\n"
             f"{kline_table}\n\n"
@@ -1002,14 +1248,17 @@ class PromptAssembler:
         frame: KlineFrame,
         previous_record: AnalysisRecord,
         new_bar_count: int,
+        *,
+        analysis_mode: str = "original",
     ) -> str:
         """Build a Stage 1 update turn using the last completed analysis."""
         pattern_block = self._stage1_pattern_supplement()
-        prefill_hint = self._render_program_prefill_hint(frame)
+        use_prefill = (analysis_mode or "original").strip().lower() == "optimized"
+        prefill_hint = self._render_program_prefill_hint(frame) if use_prefill else ""
         stage1_parts = [
             *(self._load(name) for name in STAGE1_TASK_PROMPT_TXT_FILES),
             *([pattern_block] if pattern_block else []),
-            _STAGE1_OUTPUT_REMINDER,
+            _stage1_output_reminder_for_mode(analysis_mode),
         ]
         stage1_context = "\n\n---\n\n".join(p for p in stage1_parts if p)
         n_bars = len(frame.bars)
@@ -1040,6 +1289,7 @@ class PromptAssembler:
             "- 并在 summary / risk_warning / gate_trace 中说明相对上一轮变化。\n"
             "- gate_result=proceed 时 gate_trace 仍须覆盖 §1.2、§1.3、§2.1、§2.2、§2.5（§1.1/§2.3/§2.4 由程序填充）。\n"
             "- 输出仍必须是完整阶段一 JSON，而不是差异补丁。\n\n"
+            f"{_INCREMENTAL_OUTPUT_HARD_RULES}\n\n"
             f"{stage1_context}\n\n"
             "---\n\n"
             f"## 当前分析目标\n\n"
@@ -1068,15 +1318,20 @@ class PromptAssembler:
         frame: KlineFrame,
         previous_record: AnalysisRecord,
         new_bar_count: int,
+        *,
+        analysis_mode: str = "original",
     ) -> str:
         """Build the incremental continuation user turn (message [3] in 4-message mode).
 
         Only sends NEW K-line data; the model can reference the full K-line table
         from the previous Stage 1 user message ([1]) above.
-        Injects prefill_hint so the AI knows the updated §2.3/§2.4 verdicts
+        Injects prefill_hint in optimized mode so the AI knows the updated §2.3/§2.4
+        verdicts even though the full K-line table is not re-sent. In original mode
+        the prefill hint is suppressed so the AI reasons independently.
         even though the full K-line table is not re-sent.
         """
-        prefill_hint = self._render_program_prefill_hint(frame)
+        use_prefill = (analysis_mode or "original").strip().lower() == "optimized"
+        prefill_hint = self._render_program_prefill_hint(frame) if use_prefill else ""
         n_bars = len(frame.bars)
         new_count = max(0, min(new_bar_count, n_bars))
         new_kline_table = self._render_kline_table(frame, limit=new_count)
@@ -1101,6 +1356,8 @@ class PromptAssembler:
             "- 先独立审视完整 K 线数据，形成自己的判断，再与上一轮结论对照。\n"
             "- 如果市场结构确实未被破坏，可以延续上一轮 cycle_position/direction，但必须用新增 K 线重新说明依据。\n"
             "- 如果新增 K 线出现突破、反转、极端波动或让原结论失效，必须更新诊断——宁可过度更新，不可锚定延续。\n"
+            "- 若 K1 收盘已突破上一轮 resistance_levels 或跌破 support_levels，必须重算支撑/阻力，"
+            "不得原样延续已失效价位（程序也会按收盘价剔除失效档位）。\n"
             "- 必须输出顶层字段 **incremental_delta**（不可省略），结构示例：\n"
             '  "incremental_delta": {"new_closed_bars":["K1"],'
             '"changed_fields":["direction","cycle_position"],'
@@ -1109,6 +1366,7 @@ class PromptAssembler:
             "- 并在 summary / risk_warning / gate_trace 中说明相对上一轮变化。\n"
             "- gate_result=proceed 时 gate_trace 仍须覆盖 §1.2、§1.3、§2.1、§2.2、§2.5（§1.1/§2.3/§2.4 由程序填充）。\n"
             "- 输出仍必须是完整阶段一 JSON，而不是差异补丁。\n\n"
+            f"{_INCREMENTAL_OUTPUT_HARD_RULES}\n\n"
             f"## 当前分析目标更新\n\n"
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars} 新增已收盘K线:{new_count}\n"
             f"（K线序号已重新编号：1=最新已收盘，最大 K{n_bars}；"
@@ -1143,7 +1401,6 @@ class PromptAssembler:
             stage1_json=stage1_json,
             strategy_files=strategy_files,
             experience_entries=experience_entries,
-            include_kline_table=True,
             decision_stance=decision_stance,
         )
         return [
@@ -1196,46 +1453,33 @@ class PromptAssembler:
         experience_entries: list[Any],
         decision_stance: str = "conservative",
         previous_record: Any | None = None,
+        enable_next_bar_prediction: bool = True,
     ) -> list[dict]:
-        """Build Stage 2 as a true continuation of the Stage 1 conversation.
+        """Build Stage 2 as a standalone API turn (decoupled from Stage 1 chat).
 
         Structure:
-          [0] system    — Stage 2 system prompt (full decision tree, same as Stage 1)
-          [1] user      — Stage 1 original user prompt (with K-line table, from stage1_messages)
-          [2] user      — Stage 2 task prompt (without K-line table; embeds S1 diagnosis JSON)
+          [0] system — Stage 2 system prompt
+          [1] user   — Stage 2 task + compact stage1 JSON + K-line tables
 
-        Note: the ``assistant`` role is intentionally omitted.  Including it would
-        make ``messages[2]`` (the S2 user turn) unique every cycle because the
-        prefix preceding it changes — the assistant content contains the S1 reply
-        JSON which varies each run.  Without the assistant message, the prefix is:
-          system (static) + user[S1] (static per symbol/tf/barcount)
-        and the S2 user turn only needs to re-send the dynamic diagnosis JSON,
-        keeping the large strategy-file block fully cached.
+        We intentionally **do not** prepend the Stage 1 user turn.  OpenClaw Agent
+        often misreads ``system + stage1_user + stage2_user`` as a finished
+        two-phase chat and replies with prose menus (category=d retries).
         """
+        del stage1_messages, stage1_reply_content  # kept for call-site compatibility
         system_content = self._build_stage2_system_prompt()
-
-        # Extract Stage 1 user message (contains K-line table; no need to rebuild)
-        stage1_user_content = ""
-        for msg in stage1_messages:
-            if msg.get("role") == "user":
-                stage1_user_content = msg["content"]
-                break
-
-        # Stage 2 user prompt: include_kline_table=False → "沿用上一轮" fallback
         stage2_user_content = self._build_stage2_user_prompt(
             frame=frame,
             stage1_json=stage1_json,
             strategy_files=strategy_files,
             experience_entries=experience_entries,
-            include_kline_table=False,
             decision_stance=decision_stance,
             previous_record=previous_record,
+            enable_next_bar_prediction=enable_next_bar_prediction,
         )
 
         return [
-            {"role": "system",    "content": system_content},
-            {"role": "user",      "content": stage1_user_content},
-            {"role": "user",      "content": stage2_user_content},
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": stage2_user_content},
         ]
 
     def _build_stage2_user_prompt(
@@ -1245,16 +1489,20 @@ class PromptAssembler:
         stage1_json: dict,
         strategy_files: list[str],
         experience_entries: list[Any],
-        include_kline_table: bool,
         decision_stance: str = "conservative",
         previous_record: Any | None = None,
+        enable_next_bar_prediction: bool = True,
     ) -> str:
         """Build the Stage 2 task turn for standalone or continuation mode."""
         stance_block = build_decision_stance_guidance(normalize_stance(decision_stance))
+        conflict_block = self._render_trend_conflict_guidance(stage1_json)
         transition_block = self._render_transition_guidance(stage1_json)
+        planned_limit_block = self._render_planned_limit_hint(stage1_json, frame)
         stage2_parts = [
             stance_block,
+            conflict_block,
             transition_block,
+            planned_limit_block,
             *(
                 self._load(name)
                 for name in stage2_user_task_txt_files(
@@ -1281,8 +1529,13 @@ class PromptAssembler:
                 )
             )
         stage2_parts.append(_STAGE2_OUTPUT_CONTRACT)
-        stage2_parts.append(_NEXT_BAR_PREDICTION_INSTRUCTION)
-        stage2_parts.append(_NEXT_CYCLE_PREDICTION_INSTRUCTION)
+        if enable_next_bar_prediction:
+            stage2_parts.append(_NEXT_BAR_PREDICTION_INSTRUCTION)
+        else:
+            stage2_parts.append(_NEXT_BAR_DISABLED_NOTE)
+        stage2_parts.append(
+            _build_next_cycle_prediction_instruction(enable_next_bar=enable_next_bar_prediction)
+        )
         stage2_context = "\n\n---\n\n".join(p for p in stage2_parts if p)
 
         kline_table = self._render_kline_table(frame)
@@ -1296,25 +1549,21 @@ class PromptAssembler:
         n_bars = len(frame.bars)
         breakout_tick_hint = format_breakout_tick_hint(frame)
         kline_block = (
-            f"## K线数据(与阶段一相同, 共{n_bars}根，含阳阴列；各节点 bar_range 由你据实填写)\n\n"
+            f"## K线数据(共{n_bars}根，含阳阴列；各节点 bar_range 由你据实填写)\n\n"
             f"{kline_table}\n\n"
             "## K线几何特征(程序预计算，仅作逐棒客观辅助；不得替代交易者方程；"
             "基于当前 N 根已收盘 K 线，指标非全历史延续)\n\n"
             f"{feature_table}\n\n"
-            if include_kline_table
-            else (
-                f"## K线数据\n\n"
-                f"沿用上一轮阶段一用户消息中的同一份 K线数据，共 {n_bars} 根。"
-                f"各节点 bar_range 由你据实填写，必要时可回溯上方阶段一用户消息查看具体价格。\n\n"
-            )
         )
-        if breakout_tick_hint and include_kline_table:
+        if breakout_tick_hint:
             kline_block += f"{breakout_tick_hint}\n\n"
         prev_pred_block = self._render_previous_prediction(previous_record)
         return (
+            f"{_STAGE2_API_TASK_RULE}\n\n"
             "## 阶段二任务\n\n"
             "你现在独立执行阶段二：交易决策、风险收益和下单方式评估（基于阶段一诊断结果）。\n"
-            "以下 JSON 是程序校验通过后的阶段一诊断结果，请以此为权威依据；阶段一 K 线数据见上方阶段一用户消息。\n\n"
+            "以下 JSON 是程序校验通过后的阶段一诊断结果，请以此为权威依据；"
+            "本消息下方附有完整 K 线表与几何特征。\n\n"
             f"{stage2_context}\n\n"
             "---\n\n"
             f"## 阶段一诊断结果\n\n```json\n"
@@ -1350,7 +1599,10 @@ class PromptAssembler:
             "detected_patterns",
             "key_signals",
             "htf_context",
+            "trend_context",
             "entry_setup",
+            "support_levels",
+            "resistance_levels",
             "strategy_files_needed",
             "risk_warning",
             "bar_analysis",
@@ -1359,6 +1611,29 @@ class PromptAssembler:
             "gate_result",
         )
         return {k: stage1_json[k] for k in keys if k in stage1_json}
+
+    @staticmethod
+    def _render_trend_conflict_guidance(stage1_json: dict) -> str:
+        """Stage-2 guidance when long-range background conflicts with recent direction."""
+        tc = stage1_json.get("trend_context")
+        if not isinstance(tc, dict) or not tc.get("conflict"):
+            return ""
+        bg = tc.get("background_direction", "neutral")
+        td = tc.get("trading_direction", "neutral")
+        spike = tc.get("recent_spike")
+        lines = [
+            "## 新旧趋势冲突指导（Brooks 并列原则）",
+            "",
+            f"长程背景方向：**{bg}**；交易主方向（近期）：**{td}**。",
+            f"- {tc.get('with_trend_rule', '')}",
+            "- **禁止**仅因长程背景相反而拒绝顺近期方向的入场或判 gate=wait。",
+            "- 逆势交易指**逆近期主方向**；顺近期即顺势，即使逆长程背景。",
+            "- 在 risk_assessment / watch_points 写明长程背景带来的磁力位与阻力，而非否定方向。",
+            "- 仓位不因冲突自动减半；由信号强度与交易者方程决定。",
+        ]
+        if spike:
+            lines.append(f"- 程序检测到近端 **{spike}** 尖峰：优先按尖峰/回撤逻辑，不追突破。")
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _render_transition_guidance(stage1_json: dict) -> str:
@@ -1382,6 +1657,116 @@ class PromptAssembler:
             f"- 入场选择：{selectivity}。\n"
             "- 不因为状态转换而跳过 §9、§10、§14；只是提高信号质量门槛并降低交易频率。"
         )
+
+    @staticmethod
+    def _parse_level_midpoint(raw: object) -> float | None:
+        """Parse support/resistance level string to a numeric midpoint."""
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        if "-" in text:
+            parts = [p.strip() for p in text.split("-", 1)]
+            try:
+                lo = float(parts[0])
+                hi = float(parts[1])
+                return (lo + hi) / 2.0
+            except (TypeError, ValueError, IndexError):
+                return None
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _render_planned_limit_hint(stage1_json: dict, frame: KlineFrame) -> str:
+        """Contextual hint when channel/range structure favors planned limit orders."""
+        cycle = str(stage1_json.get("cycle_position", "") or "").strip().lower()
+        if cycle not in (
+            "broad_channel",
+            "trading_range",
+            "normal_channel",
+            "trending_tr",
+        ):
+            return ""
+
+        bars = getattr(frame, "bars", None) or ()
+        if not bars:
+            return ""
+
+        try:
+            close = float(getattr(bars[0], "close", 0))
+        except (TypeError, ValueError):
+            return ""
+
+        indicators = getattr(frame, "indicators", None)
+        atr = None
+        try:
+            atr_vals = getattr(indicators, "atr14", ()) or ()
+            if atr_vals and not math.isnan(float(atr_vals[0])):
+                atr = float(atr_vals[0])
+        except (TypeError, ValueError, IndexError):
+            atr = None
+
+        proximity = max(atr * 0.35, abs(close) * 0.0008) if atr and atr > 0 else abs(close) * 0.002
+
+        supports = stage1_json.get("support_levels") or []
+        resistances = stage1_json.get("resistance_levels") or []
+        if not isinstance(supports, list):
+            supports = []
+        if not isinstance(resistances, list):
+            resistances = []
+
+        near_support: float | None = None
+        near_resist: float | None = None
+        support_label = ""
+        resist_label = ""
+        for lv in supports:
+            mid = PromptAssembler._parse_level_midpoint(lv)
+            if mid is not None and mid <= close and abs(close - mid) <= proximity:
+                if near_support is None or mid > near_support:
+                    near_support = mid
+                    support_label = str(lv)
+        for lv in resistances:
+            mid = PromptAssembler._parse_level_midpoint(lv)
+            if mid is not None and mid >= close and abs(close - mid) <= proximity:
+                if near_resist is None or mid < near_resist:
+                    near_resist = mid
+                    resist_label = str(lv)
+
+        direction = str(stage1_json.get("direction", "neutral") or "neutral").strip().lower()
+        lines = [
+            "## §9.0 计划型限价提示（程序根据阶段一结构生成）",
+            "",
+            f"- cycle_position=**{cycle}** → 默认优先考虑 **限价单**（§11），"
+            "尤其在通道/区间 **边界** 而非中部。",
+            "- 当前 K1 收盘附近若无强信号棒（doji/弱棒/无跟随），**不要**直接将 §9.0 判否；"
+            "应先评估能否在结构位挂限价且通过 §10.1–10.3。",
+            "- §9.0=是 时：signal_bar.bar 可为 null、quality=invalid/weak；"
+            "entry_bar 设 not_triggered/pending。",
+        ]
+        if near_support is not None:
+            lines.append(
+                f"- 价格靠近下方支撑 **{support_label}**（约 {near_support:.4f}）→ "
+                "可评估 **做多限价单**（回撤至支撑买入）。"
+            )
+        if near_resist is not None:
+            lines.append(
+                f"- 价格靠近上方阻力 **{resist_label}**（约 {near_resist:.4f}）→ "
+                "可评估 **做空限价单**（反弹至阻力卖出）。"
+            )
+        if near_support is None and near_resist is None:
+            lines.append(
+                "- 未识别到极近的支撑/阻力；若仍在通道/区间边界区域，"
+                "请结合 K 线摆动高低点与 EMA 自行定价。"
+            )
+        if direction == "neutral":
+            lines.append(
+                "- 阶段一 direction=neutral：阶段二可在边界 setup 上选定 "
+                "bullish/bearish 并给出对应限价方向（校验允许 neutral→有方向补充）。"
+            )
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _render_experience(

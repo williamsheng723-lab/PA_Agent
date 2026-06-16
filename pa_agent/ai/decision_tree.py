@@ -445,6 +445,16 @@ def build_stage2_gate_wait_response(stage1_json: dict[str, Any]) -> dict[str, An
             "unpredictable": True,
             "features_used": ["stage1_diagnosis"],
         },
+        "next_cycle_prediction": {
+            "cycle": None,
+            "direction": None,
+            "probabilities": None,
+            "reasoning": (
+                f"阶段一闸门未通过（{node_id}），未进入阶段二周期演变评估。"
+            ),
+            "unpredictable": True,
+            "features_used": ["stage1_diagnosis"],
+        },
     }
 
 
@@ -486,12 +496,19 @@ def validate_gate_result_consistency(stage1: dict[str, Any]) -> list[str]:
     # Check node_id ordering: gate_trace must be in ascending chapter-section order.
     # merge_program_nodes now sorts injected nodes, but validate here to catch any
     # future regression or manually constructed traces with wrong ordering.
+    #
+    # Exception: when gate_result=wait/unknown, merge_program_nodes_head prepends
+    # program nodes so the AI's terminating node (answer=否/等待) stays at the tail.
+    # That terminal node is intentionally out of numeric order — skip the ordering
+    # check for the last node in wait/unknown traces.
     node_ids = [
         str(item.get("node_id", ""))
         for item in trace
         if isinstance(item, dict) and item.get("node_id")
     ]
-    for idx in range(1, len(node_ids)):
+    terminal_exempt = gate_result in ("wait", "unknown") and len(node_ids) > 1
+    check_up_to = len(node_ids) - 1 if terminal_exempt else len(node_ids)
+    for idx in range(1, check_up_to):
         prev_key = _gate_trace_sort_key(node_ids[idx - 1])
         curr_key = _gate_trace_sort_key(node_ids[idx])
         if curr_key < prev_key:
@@ -532,6 +549,15 @@ def validate_stage2_trace_consistency(stage2: dict[str, Any]) -> list[str]:
     if order_type in ("限价单", "突破单", "市价单") and outcome in ("wait", "reject"):
         errors.append(
             f"order_type {order_type} cannot pair with terminal.outcome {outcome!r}"
+        )
+    if (
+        order_type in ("限价单", "突破单", "市价单")
+        and outcome == "trade"
+        and str(terminal.get("node_id", "") or "").strip().startswith("14")
+    ):
+        errors.append(
+            "terminal.node_id must not be §14 for a trade; §14 is only a prohibition scan, "
+            "use the final §11 order node or 10.3"
         )
 
     for i, item in enumerate(trace):

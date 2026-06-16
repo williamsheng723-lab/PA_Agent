@@ -205,6 +205,10 @@ class FutureTrendPanel(QWidget):
         )
 
         reasoning = str(pred.get("reasoning", "")).strip()
+        if "程序根据阶段二诊断摘要补全" in reasoning or "程序参考分布" in reasoning:
+            prefix = "【程序补全】模型未输出 next_bar_prediction，以下为参考预测。\n\n"
+            if not reasoning.startswith("【程序补全】"):
+                reasoning = prefix + reasoning
         self._bar_reasoning_edit.setPlainText(reasoning)
         self._bar_group.setVisible(True)
 
@@ -295,6 +299,10 @@ class FutureTrendPanel(QWidget):
             self._cycle_probs_label.setVisible(False)
 
         reasoning = str(pred.get("reasoning", "")).strip()
+        if "程序根据阶段二诊断摘要补全" in reasoning or "程序参考分布" in reasoning:
+            prefix = "【程序补全】模型未输出 next_cycle_prediction，以下为参考预测。\n\n"
+            if not reasoning.startswith("【程序补全】"):
+                reasoning = prefix + reasoning
         self._cycle_reasoning_edit.setPlainText(reasoning)
         self._cycle_group.setVisible(True)
 

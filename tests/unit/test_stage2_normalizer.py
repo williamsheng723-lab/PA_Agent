@@ -4,9 +4,190 @@ from __future__ import annotations
 import json
 
 from pa_agent.ai.json_validator import Ok
-from pa_agent.ai.stage2_normalizer import normalize_stage2, _normalize_next_bar_prediction
+from pa_agent.ai.stage2_normalizer import (
+    _normalize_closed_enum,
+    _normalize_stage2_bar_analysis_enums,
+    _strip_enum_suffix,
+    normalize_stage2,
+    _normalize_next_bar_prediction,
+)
 from pa_agent.data.base import IndicatorBundle, KlineBar, KlineFrame
 from tests.fixtures.validators import schema_test_validator
+
+
+# ── Closed enum annotation stripping (bar_type / freshness) ────────────────
+
+
+def test_strip_enum_suffix_removes_chinese_parenthetical() -> None:
+    assert _strip_enum_suffix("invalid（K1突破K2 low后反向）") == "invalid"
+    assert _strip_enum_suffix("outside_bull（沿用阶段一bar_analysis.bar_type）") == "outside_bull"
+
+
+def test_normalize_closed_enum_freshness_with_annotation() -> None:
+    assert _normalize_closed_enum(
+        "invalid（信号失效）",
+        frozenset({"fresh", "pending", "stale", "invalid"}),
+    ) == "invalid"
+
+
+def test_normalize_stage2_bar_analysis_enums_from_user_report() -> None:
+    out = {
+        "bar_analysis": {
+            "always_in": "long",
+            "last_closed_bar": "K1",
+            "bar_type": "outside_bull（沿用阶段一bar_analysis.bar_type）",
+            "entry_bar": {
+                "strength": "weak",
+                "follow_through": False,
+                "still_valid": False,
+                "freshness": "invalid（K1突破K2 low=64198.94触发做空入场后收阳线反向）",
+            },
+        }
+    }
+    stage1 = {"bar_analysis": {"bar_type": "outside_bull"}}
+    assert _normalize_stage2_bar_analysis_enums(out, stage1_json=stage1) is True
+    assert out["bar_analysis"]["bar_type"] == "outside_bull"
+    assert out["bar_analysis"]["entry_bar"]["freshness"] == "invalid"
+
+
+def test_normalize_second_entry_type_null_passes_schema() -> None:
+    """Models emit type=null when is_second_entry=false; schema requires string."""
+    payload = {
+        "decision": {
+            "order_type": "不下单",
+            "order_direction": None,
+            "entry_price": None,
+            "take_profit_price": None,
+            "stop_loss_price": None,
+            "reasoning": "区间中部等待",
+            "diagnosis_confidence": 65,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 55,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": None,
+            "estimated_win_rate_reasoning": None,
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "trending_tr",
+            "direction": "neutral",
+            "key_signals": [],
+        },
+        "bar_analysis": {
+            "always_in": "long",
+            "last_closed_bar": "K1",
+            "bar_type": "other",
+            "signal_bar": {
+                "bar": "K1",
+                "quality": "weak",
+                "pattern": "none",
+                "reason": "弱信号",
+            },
+            "entry_bar": {
+                "strength": "not_triggered",
+                "follow_through": False,
+                "still_valid": False,
+                "freshness": "invalid",
+            },
+            "second_entry": {"is_second_entry": False, "type": None},
+        },
+        "decision_trace": [
+            {
+                "node_id": "9.0",
+                "question": "信号棒是否合格？",
+                "answer": "否",
+                "reason": "区间中部",
+                "bar_range": "K8-K1",
+            },
+        ],
+        "terminal": {
+            "node_id": "9.0",
+            "outcome": "wait",
+            "label": "区间中部等待边界触发",
+        },
+    }
+    out = normalize_stage2(payload)
+    assert out["bar_analysis"]["second_entry"]["type"] == "none"
+
+    result = schema_test_validator().validate(
+        "stage2",
+        json.dumps(out, ensure_ascii=False),
+    )
+    assert isinstance(result, Ok)
+
+
+def test_normalize_stage2_enum_annotations_passes_schema() -> None:
+    payload = {
+        "decision": {
+            "order_type": "不下单",
+            "order_direction": None,
+            "entry_price": None,
+            "take_profit_price": None,
+            "stop_loss_price": None,
+            "reasoning": "信号失效，等待",
+            "diagnosis_confidence": 70,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 65,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": None,
+            "estimated_win_rate_reasoning": None,
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "broad_channel",
+            "direction": "bearish",
+            "key_signals": [],
+        },
+        "bar_analysis": {
+            "always_in": "long",
+            "last_closed_bar": "K1",
+            "bar_type": "outside_bull（沿用阶段一bar_analysis.bar_type）",
+            "signal_bar": {
+                "bar": "K2",
+                "quality": "strong",
+                "pattern": "none",
+                "reason": "test",
+            },
+            "entry_bar": {
+                "bar": "K1",
+                "strength": "weak",
+                "follow_through": False,
+                "still_valid": False,
+                "freshness": "invalid（K1突破K2 low后反向，信号失效）",
+            },
+        },
+        "decision_trace": [
+            {
+                "node_id": "9.0",
+                "question": "信号棒是否合格？",
+                "answer": "否",
+                "reason": "freshness=invalid",
+                "bar_range": "K2-K1",
+            },
+        ],
+        "terminal": {
+            "node_id": "9.0",
+            "outcome": "wait",
+            "label": "无可靠入场方案",
+        },
+    }
+    stage1 = {"bar_analysis": {"bar_type": "outside_bull"}}
+    out = normalize_stage2(payload, stage1_json=stage1)
+    assert out["bar_analysis"]["bar_type"] == "outside_bull"
+    assert out["bar_analysis"]["entry_bar"]["freshness"] == "invalid"
+
+    result = schema_test_validator().validate(
+        "stage2",
+        json.dumps(out, ensure_ascii=False),
+        stage1_json=stage1,
+    )
+    assert isinstance(result, Ok)
 
 
 # ── _normalize_next_bar_prediction direct tests ──────────────────────────────
@@ -343,6 +524,107 @@ def test_coerce_decision_when_103_no_but_prices_remain() -> None:
     assert isinstance(result, Ok)
 
 
+def test_trade_terminal_14_repaired_to_order_node() -> None:
+    """§14 is a prohibition scan, not the terminal node for successful trades."""
+    payload = {
+        "decision": {
+            "order_direction": "做空",
+            "order_type": "限价单",
+            "entry_price": 100.0,
+            "entry_basis_bar": None,
+            "entry_basis_extreme": None,
+            "entry_rule": None,
+            "take_profit_price": 90.0,
+            "stop_loss_price": 107.0,
+            "reasoning": "test",
+            "diagnosis_confidence": 70,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 55,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": 55,
+            "estimated_win_rate_reasoning": "t",
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "t",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "trading_range",
+            "direction": "bearish",
+            "key_signals": [],
+        },
+        "bar_analysis": {
+            "always_in": "short",
+            "last_closed_bar": "K1",
+            "bar_type": "doji",
+            "signal_bar": {
+                "bar": None,
+                "quality": "invalid",
+                "pattern": "none",
+                "reason": "计划型限价",
+            },
+            "entry_bar": {
+                "bar": None,
+                "strength": "not_triggered",
+                "follow_through": "pending",
+                "freshness": "pending",
+            },
+        },
+        "decision_trace": [
+            {
+                "node_id": "9.0",
+                "question": "信号棒是否合格？",
+                "answer": "是",
+                "reason": "计划型限价",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.1",
+                "question": "是否能明确止损？",
+                "answer": "是",
+                "reason": "t",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.2",
+                "question": "止损是否过大？",
+                "answer": "否",
+                "reason": "t",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.3",
+                "question": "交易者方程是否通过？",
+                "answer": "是",
+                "reason": "risk=7 reward=10",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "11.3",
+                "question": "是交易区间吗？",
+                "answer": "是",
+                "reason": "限价单",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "14.1",
+                "question": "是否触犯禁止行为？",
+                "answer": "否",
+                "reason": "未触犯任何禁止项",
+                "bar_range": "K1",
+            },
+        ],
+        "terminal": {"node_id": "14.1", "outcome": "trade", "label": "限价做空"},
+    }
+    out = normalize_stage2(payload)
+    assert out["terminal"]["node_id"] == "11.3"
+    assert out["terminal"]["outcome"] == "trade"
+    assert out["decision"]["order_type"] == "限价单"
+
+    result = schema_test_validator().validate("stage2", json.dumps(out, ensure_ascii=False))
+    assert isinstance(result, Ok)
+
+
 def test_signal_bar_bumped_when_same_seq_as_entry() -> None:
     obj = {
         "decision": {
@@ -352,7 +634,7 @@ def test_signal_bar_bumped_when_same_seq_as_entry() -> None:
             "entry_basis_bar": "K3",
             "entry_basis_extreme": "low",
             "entry_rule": "test",
-            "take_profit_price": 3.0,
+            "take_profit_price": 3.20,
             "stop_loss_price": 3.6,
             "reasoning": "t",
             "diagnosis_confidence": 50,
@@ -417,4 +699,150 @@ def test_normalize_stage2_without_prediction_noop():
         "terminal": {"node_id": "0", "outcome": "wait", "label": "test"},
     }
     result = normalize_stage2(obj)
-    assert "next_bar_prediction" not in result
+    assert isinstance(result.get("next_bar_prediction"), dict)
+    assert isinstance(result.get("next_cycle_prediction"), dict)
+
+
+def test_repair_next_bar_yinxian_singular_probability() -> None:
+    """阴线 + probability shorthand from production failures must normalize."""
+    obj = {
+        "decision": {
+            "order_type": "不下单",
+            "order_direction": None,
+            "entry_price": None,
+            "take_profit_price": None,
+            "stop_loss_price": None,
+            "reasoning": "test",
+            "diagnosis_confidence": 55,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 55,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": None,
+            "estimated_win_rate_reasoning": None,
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "t",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "trending_tr",
+            "direction": "neutral",
+            "key_signals": [],
+        },
+        "decision_trace": [],
+        "terminal": {"node_id": "0", "outcome": "wait", "label": "test"},
+        "next_bar_prediction": {
+            "direction": "阴线",
+            "probability": 60,
+            "reasoning": "测试理由" * 10,
+        },
+        "next_cycle_prediction": {
+            "cycle": "trending_tr",
+            "direction": "neutral",
+            "probabilities": {
+                "spike": 3,
+                "micro_channel": 5,
+                "tight_channel": 8,
+                "normal_channel": 20,
+                "broad_channel": 35,
+                "trending_tr": 15,
+                "trading_range": 10,
+                "extreme_tr": 4,
+            },
+            "unpredictable": False,
+            "reasoning": "周期预测理由",
+            "features_used": ["stage1_diagnosis"],
+        },
+    }
+    out = normalize_stage2(obj)
+    nb = out["next_bar_prediction"]
+    assert nb["direction"] == "bearish"
+    assert isinstance(nb["probabilities"], dict)
+    assert sum(nb["probabilities"].values()) == 100
+    assert nb["probabilities"]["bearish"] == 60
+
+
+def test_validator_injects_next_bar_when_feature_disabled() -> None:
+    """skip_next_bar=True must not skip schema-required injection during validate()."""
+    payload = {
+        "decision": {
+            "order_type": "不下单",
+            "order_direction": None,
+            "entry_price": None,
+            "take_profit_price": None,
+            "stop_loss_price": None,
+            "reasoning": "test",
+            "diagnosis_confidence": 55,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 55,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": None,
+            "estimated_win_rate_reasoning": None,
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "t",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "trending_tr",
+            "direction": "neutral",
+            "key_signals": [],
+        },
+        "decision_trace": [],
+        "terminal": {"node_id": "0", "outcome": "wait", "label": "test"},
+        "next_cycle_prediction": {
+            "cycle": "trending_tr",
+            "direction": "neutral",
+            "probabilities": {
+                "spike": 3,
+                "micro_channel": 5,
+                "tight_channel": 8,
+                "normal_channel": 20,
+                "broad_channel": 35,
+                "trending_tr": 15,
+                "trading_range": 10,
+                "extreme_tr": 4,
+            },
+            "unpredictable": False,
+            "reasoning": "周期预测理由",
+            "features_used": ["stage1_diagnosis"],
+        },
+    }
+    v = schema_test_validator()
+    result = v.validate("stage2", json.dumps(payload), skip_next_bar=True)
+    assert isinstance(result, Ok)
+    assert isinstance(result.obj.get("next_bar_prediction"), dict)
+
+
+def test_normalize_stage2_skip_next_bar_ui_path_omits_injection() -> None:
+    """UI replay with feature off should not synthesize next_bar for display."""
+    obj = {
+        "decision": {
+            "order_type": "不下单",
+            "order_direction": None,
+            "entry_price": None,
+            "take_profit_price": None,
+            "stop_loss_price": None,
+            "reasoning": "test",
+            "diagnosis_confidence": 55,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 55,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": None,
+            "estimated_win_rate_reasoning": None,
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "t",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "trending_tr",
+            "direction": "neutral",
+            "key_signals": [],
+        },
+        "decision_trace": [],
+        "terminal": {"node_id": "0", "outcome": "wait", "label": "test"},
+    }
+    out = normalize_stage2(obj, skip_next_bar=True)
+    assert "next_bar_prediction" not in out
+    assert isinstance(out.get("next_cycle_prediction"), dict)

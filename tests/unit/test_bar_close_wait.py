@@ -83,13 +83,18 @@ def test_forming_closed_with_server_now_when_local_lags() -> None:
 
 
 def test_reference_now_ms_uses_server_time_ms() -> None:
+    import time
     from pa_agent.data.bar_close_wait import reference_now_ms
+
+    # Simulate a fresh broker tick: server time is very close to local time
+    # (within 60 s), so reference_now_ms should return the broker server time.
+    fresh_server_ms = int(time.time() * 1000) - 5_000  # 5 s behind local → within threshold
 
     class _Src:
         def server_time_ms(self) -> int:
-            return 9_999_888_777
+            return fresh_server_ms
 
-    assert reference_now_ms(data_source=_Src()) == 9_999_888_777
+    assert reference_now_ms(data_source=_Src()) == fresh_server_ms
 
 
 def test_active_intraday_bar_still_forming() -> None:

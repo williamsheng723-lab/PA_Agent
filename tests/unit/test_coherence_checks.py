@@ -132,7 +132,11 @@ def test_stage2_order_direction_conflicts_stage1() -> None:
         },
     }
     errs = validate_stage2_coherence(s2, s1, kline_frame=_frame())
-    assert any("做空 conflicts" in e for e in errs)
+    assert not any("做空 conflicts" in e for e in errs)
+    assert any(
+        isinstance(x, dict) and x.get("node_id") == "2.3" and x.get("branch") == "bearish"
+        for x in s2["decision_trace"]
+    )
 
 
 def test_incremental_requires_delta_language() -> None:

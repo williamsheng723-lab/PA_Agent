@@ -39,9 +39,12 @@ logger = logging.getLogger(__name__)
 BAR_COUNT_THRESHOLD: int = 20           # §1.1 data sufficiency threshold
 
 DIRECTION_WINDOW: int = 8               # §2.3 direction voting window (short) — 缩小到8根，重点捕捉近期结构突变
-DIRECTION_WINDOW_MED: int = 20         # §2.3 medium window for confirmation vote — 原20根窗口降为中窗口，50根太滞后
+DIRECTION_WINDOW_MED: int = 20         # §2.3 medium window — 仅作背景参考，强短窗口时不扣分
+DIRECTION_STRONG_SHORT_SCORE: int = 4   # |score|≥此值时忽略中窗口冲突（新趋势优先于旧背景）
 
-ALWAYS_IN_WINDOW: int = 20             # §2.4 Always In window
+ALWAYS_IN_NEAR_WINDOW: int = 8          # §2.4 近端主判（Brooks：惯性=刚刚在做的事）
+ALWAYS_IN_WINDOW: int = 20             # §2.4 背景参考窗口（不否决近端结论）
+ALWAYS_IN_NEAR_SAME_SIDE_RATIO: float = 0.65  # 近端加权同侧占比（8根窗口略低于20根阈值）
 
 ALWAYS_IN_SAME_SIDE_RATIO: float = 0.7  # §2.4 same-side ratio threshold
 ALWAYS_IN_PULLBACK_ATR_RATIO: float = 1.5  # §2.4 max pullback depth (×ATR) for AIL/AIS
@@ -917,9 +920,15 @@ def judge_direction(frame: Any) -> tuple[str, NodeFill]:
         pass
 
     if med_confirm != 0 and score != 0 and med_confirm != (1 if score > 0 else -1):
-        score_before = score
-        score = score - (1 if score > 0 else -1)
-        med_confirm_desc += f"（与短窗口冲突，score {score_before}→{score}）"
+        if abs(score) >= DIRECTION_STRONG_SHORT_SCORE:
+            med_confirm_desc += (
+                f"（背景窗口与短窗口冲突，但|score|={abs(score)}"
+                f"≥{DIRECTION_STRONG_SHORT_SCORE}，新趋势优先，不扣分）"
+            )
+        else:
+            score_before = score
+            score = score - (1 if score > 0 else -1)
+            med_confirm_desc += f"（与短窗口冲突，score {score_before}→{score}）"
     else:
         if med_confirm != 0:
             med_confirm_desc += "（与短窗口一致）"
@@ -1018,6 +1027,126 @@ def _find_swings(bars: Any, W: int) -> tuple[list[float], list[float]]:
 # ── AlwaysInJudge ─────────────────────────────────────────────────────────────
 
 
+def _weighted_ema_side_weights(
+    bars: Any, N: int, ema20: tuple,
+) -> tuple[float, float]:
+    """Linear-decay weighted counts of closes above/below EMA in first N bars."""
+    w_above = 0.0
+    w_below = 0.0
+    for i, bar in enumerate(list(bars)[:N]):
+        if i >= len(ema20):
+            break
+        try:
+            ema_val = float(ema20[i])
+            close_val = float(bar.close)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if math.isnan(ema_val):
+            continue
+        weight = float(N - i)
+        if close_val > ema_val:
+            w_above += weight
+        elif close_val < ema_val:
+            w_below += weight
+    return w_above, w_below
+
+
+def _eval_always_in_gates(
+    bars: Any,
+    N: int,
+    ema20: tuple,
+    atr14: tuple,
+    n: int,
+    *,
+    slope_lookback: int,
+    same_side_ratio: float,
+) -> dict[str, Any]:
+    """Evaluate AIL/AIS gate bundle for a window of N bars (index 0 = newest)."""
+    w_above, w_below = _weighted_ema_side_weights(bars, N, ema20)
+    valid_w = w_above + w_below
+    if valid_w <= 0:
+        above_ratio = below_ratio = 0.0
+    else:
+        above_ratio = w_above / valid_w
+        below_ratio = w_below / valid_w
+
+    slope_sign = 0
+    slope_desc = "EMA斜率:0"
+    try:
+        if ema20 and len(ema20) >= 1 and not math.isnan(float(ema20[0])):
+            k = min(slope_lookback, n - 1)
+            if k >= 1 and len(ema20) > k and not math.isnan(float(ema20[k])):
+                d = float(ema20[0]) - float(ema20[k])
+                thr = 0.0
+                if atr14 and len(atr14) >= 1 and not math.isnan(float(atr14[0])):
+                    thr = 0.05 * float(atr14[0])
+                if d > thr:
+                    slope_sign = 1
+                    slope_desc = f"EMA斜率向上(d={d:.4f}>thr={thr:.4f})"
+                elif d < -thr:
+                    slope_sign = -1
+                    slope_desc = f"EMA斜率向下(d={d:.4f}<-thr={thr:.4f})"
+                else:
+                    slope_desc = f"EMA斜率平坦(d={d:.4f},死区±{thr:.4f})"
+    except (TypeError, ValueError):
+        pass
+
+    swing_confirms_bull = False
+    swing_confirms_bear = False
+    swing_desc = "波段结构:未验证"
+    try:
+        swing_highs, swing_lows = _find_swings(bars, N)
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+            hh = swing_highs[0] > swing_highs[1]
+            hl = swing_lows[0] > swing_lows[1]
+            ll = swing_lows[0] < swing_lows[1]
+            lh = swing_highs[0] < swing_highs[1]
+            if hh and hl:
+                swing_confirms_bull = True
+                swing_desc = "波段结构HH+HL✓(多头)"
+            elif ll and lh:
+                swing_confirms_bear = True
+                swing_desc = "波段结构LL+LH✓(空头)"
+            else:
+                swing_desc = f"波段结构混乱(HH={hh},HL={hl},LL={ll},LH={lh})"
+        else:
+            swing_desc = (
+                f"波段结构:枢轴不足(highs={len(swing_highs)},lows={len(swing_lows)})"
+            )
+    except (TypeError, ValueError, IndexError):
+        pass
+
+    pullback_atr = _max_pullback_atr(bars, N, ema20, atr14)
+    shallow = None
+    pullback_desc = "回撤:未知(ATR缺失)"
+    if pullback_atr is not None:
+        shallow = pullback_atr <= ALWAYS_IN_PULLBACK_ATR_RATIO
+        pullback_desc = (
+            f"最大价格区间{pullback_atr:.2f}×ATR"
+            f"({'≤' if shallow else '>'}{ALWAYS_IN_PULLBACK_ATR_RATIO}×阈值,"
+            f"{'浅回撤✓' if shallow else '回撤较深✗'})"
+        )
+
+    bull_core = above_ratio >= same_side_ratio and slope_sign > 0
+    bear_core = below_ratio >= same_side_ratio and slope_sign < 0
+    gate3_bull = swing_confirms_bull and (shallow is None or shallow)
+    gate3_bear = swing_confirms_bear and (shallow is None or shallow)
+
+    return {
+        "N": N,
+        "above_ratio": above_ratio,
+        "below_ratio": below_ratio,
+        "slope_sign": slope_sign,
+        "slope_desc": slope_desc,
+        "swing_desc": swing_desc,
+        "pullback_desc": pullback_desc,
+        "bull_core": bull_core,
+        "bear_core": bear_core,
+        "gate3_bull": gate3_bull,
+        "gate3_bear": gate3_bear,
+    }
+
+
 def _max_pullback_atr(bars: Any, N: int, ema20: tuple, atr14: tuple) -> float | None:
     """Compute the max intra-window pullback depth relative to ATR.
 
@@ -1046,20 +1175,14 @@ def _max_pullback_atr(bars: Any, N: int, ema20: tuple, atr14: tuple) -> float | 
 
 
 def judge_always_in(frame: Any) -> NodeFill:
-    """Judge Always In state (§2.4) with three-gate check.
+    """Judge Always In state (§2.4) with dual-window Brooks alignment.
 
-    Gate 1 (必须): Close same-side ratio ≥ 70% in last 20 bars.
-    Gate 2 (必须): EMA slope confirms direction.
-    Gate 3 (加强): Swing structure confirms (HH+HL for AIL, LL+LH for AIS).
-                   AND max pullback ≤ 1.5×ATR (shallow pullback condition).
+    Near window (K8-K1) is authoritative — captures current inertia / spike.
+    Background window (K20-K1) is reference only — does not veto near conclusion.
 
-    If Gate 1 + Gate 2 pass but Gate 3 fails → still AIL/AIS but reason
-    mentions the weaker confirmation (partial Always In).
-
-    Derived from §2.4 of 二元决策.txt and 文件20-AlwaysIn与20GB.txt:
-      - 最近20根K线多数收在EMA上方
-      - EMA上倾，且价格回撤浅
-      - HH+HL结构清晰（新增验证门）
+    Gate 1: weighted same-side ratio vs EMA.
+    Gate 2: EMA slope confirms direction.
+    Gate 3: swing structure + shallow pullback (strength label only).
     """
     bars = getattr(frame, "bars", ()) or ()
     indicators = getattr(frame, "indicators", None)
@@ -1072,180 +1195,90 @@ def judge_always_in(frame: Any) -> NodeFill:
     except (TypeError, ValueError):
         n = len(bars)
 
-    N = min(ALWAYS_IN_WINDOW, n)
+    N_near = min(ALWAYS_IN_NEAR_WINDOW, n)
+    N_bg = min(ALWAYS_IN_WINDOW, n)
 
-    # Gate 1: close vs EMA same-side ratio
-    above = 0
-    below = 0
-    for i, bar in enumerate(list(bars)[:N]):
-        if i >= len(ema20):
-            break
-        try:
-            ema_val = float(ema20[i])
-            close_val = float(bar.close)
-        except (TypeError, ValueError, AttributeError):
-            continue
-        if math.isnan(ema_val):
-            continue
-        if close_val > ema_val:
-            above += 1
-        elif close_val < ema_val:
-            below += 1
+    near = _eval_always_in_gates(
+        bars, N_near, ema20, atr14, n,
+        slope_lookback=min(5, n - 1),
+        same_side_ratio=ALWAYS_IN_NEAR_SAME_SIDE_RATIO,
+    )
+    bg = _eval_always_in_gates(
+        bars, N_bg, ema20, atr14, n,
+        slope_lookback=EMA_SLOPE_LOOKBACK,
+        same_side_ratio=ALWAYS_IN_SAME_SIDE_RATIO,
+    )
 
-    valid = above + below
-    if valid == 0:
-        above_ratio = 0.0
-        below_ratio = 0.0
-    else:
-        above_ratio = above / valid
-        below_ratio = below / valid
+    bar_range = f"K{N_near}-K1"
+    conflict_note = ""
 
-    # Gate 2: EMA slope
-    slope_sign = 0
-    slope_desc = "EMA斜率:0"
-    try:
-        if ema20 and len(ema20) >= 1 and not math.isnan(float(ema20[0])):
-            k = min(EMA_SLOPE_LOOKBACK, n - 1)
-            if k >= 1 and len(ema20) > k and not math.isnan(float(ema20[k])):
-                d = float(ema20[0]) - float(ema20[k])
-                thr = 0.0
-                if atr14 and len(atr14) >= 1 and not math.isnan(float(atr14[0])):
-                    thr = 0.05 * float(atr14[0])
-                if d > thr:
-                    slope_sign = 1
-                    slope_desc = f"EMA斜率向上(d={d:.4f}>"f"thr={thr:.4f})"
-                elif d < -thr:
-                    slope_sign = -1
-                    slope_desc = f"EMA斜率向下(d={d:.4f}<-thr={thr:.4f})"
-                else:
-                    slope_desc = f"EMA斜率平坦(d={d:.4f},死区±{thr:.4f})"
-    except (TypeError, ValueError):
-        pass
-
-    # Gate 3a: Swing structure confirmation (HH+HL for bull, LL+LH for bear)
-    swing_confirms_bull = False
-    swing_confirms_bear = False
-    swing_desc = "波段结构:未验证"
-    try:
-        swing_highs, swing_lows = _find_swings(bars, N)
-        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            hh = swing_highs[0] > swing_highs[1]
-            hl = swing_lows[0] > swing_lows[1]
-            ll = swing_lows[0] < swing_lows[1]
-            lh = swing_highs[0] < swing_highs[1]
-            if hh and hl:
-                swing_confirms_bull = True
-                swing_desc = "波段结构HH+HL✓(多头)"
-            elif ll and lh:
-                swing_confirms_bear = True
-                swing_desc = "波段结构LL+LH✓(空头)"
-            else:
-                swing_desc = f"波段结构混乱(HH={hh},HL={hl},LL={ll},LH={lh})"
-        else:
-            swing_desc = (
-                f"波段结构:枢轴不足(highs={len(swing_highs)},lows={len(swing_lows)})"
-            )
-    except (TypeError, ValueError, IndexError):
-        pass
-
-    # Gate 3b: Shallow pullback check (max close range / ATR ≤ threshold)
-    pullback_atr = _max_pullback_atr(bars, N, ema20, atr14)
-    shallow = None  # None = unknown (ATR not available)
-    pullback_desc = "回撤:未知(ATR缺失)"
-    if pullback_atr is not None:
-        shallow = pullback_atr <= ALWAYS_IN_PULLBACK_ATR_RATIO
-        pullback_desc = (
-            f"最大价格区间{pullback_atr:.2f}×ATR"
-            f"({'≤' if shallow else '>'}{ALWAYS_IN_PULLBACK_ATR_RATIO}×阈值,"
-            f"{'浅回撤✓' if shallow else '回撤较深✗'})"
-        )
-
-    bar_range = f"K{N}-K1"
-
-    # ── Decision logic ────────────────────────────────────────────────────────
-    # Core condition: Gate 1 (ratio) + Gate 2 (slope).
-    # Gate 3 (swing structure + shallow pullback) used to distinguish
-    # "confirmed AIL/AIS" vs "weak AIL/AIS" — both are classified as §2.4=是.
-    bull_core = above_ratio >= ALWAYS_IN_SAME_SIDE_RATIO and slope_sign > 0
-    bear_core = below_ratio >= ALWAYS_IN_SAME_SIDE_RATIO and slope_sign < 0
-
-    # ── Short-window divergence check ────────────────────────────────────────
-    # When the full-window (20-bar) vote says AIL/AIS, check if the most recent
-    # N_short bars are diverging from that conclusion.  This surfaces "weakening
-    # structure" info in the reason text so the AI has concrete evidence when
-    # deciding whether to submit a §2.4 override.
-    N_short = 5
-    short_above = 0
-    short_below = 0
-    for i, bar in enumerate(list(bars)[:N_short]):
-        if i >= len(ema20):
-            break
-        try:
-            ema_val = float(ema20[i])
-            close_val = float(bar.close)
-        except (TypeError, ValueError, AttributeError):
-            continue
-        if math.isnan(ema_val):
-            continue
-        if close_val > ema_val:
-            short_above += 1
-        elif close_val < ema_val:
-            short_below += 1
-    short_valid = short_above + short_below
-    short_above_ratio = short_above / short_valid if short_valid > 0 else 0.0
-    short_below_ratio = short_below / short_valid if short_valid > 0 else 0.0
-
-    # Divergence: full-window says AIL but recent N_short bars mostly below EMA,
-    # or full-window says AIS but recent N_short bars mostly above EMA.
-    _DIVERGENCE_THRESHOLD = 0.4  # if recent same-side ratio drops below this, flag it
-    divergence_warning = ""
-    if bull_core and short_above_ratio < _DIVERGENCE_THRESHOLD and short_valid > 0:
-        divergence_warning = (
-            f"⚠️ 近{N_short}根K线中仅{short_above}根收盘高于EMA20"
-            f"（占比{short_above_ratio:.0%}），与全窗口AIL结论存在背离，"
-            "AIL结构已弱化，AI可依据此短窗口背离在 node_overrides 中提交覆盖。"
-        )
-    elif bear_core and short_below_ratio < _DIVERGENCE_THRESHOLD and short_valid > 0:
-        divergence_warning = (
-            f"⚠️ 近{N_short}根K线中仅{short_below}根收盘低于EMA20"
-            f"（占比{short_below_ratio:.0%}），与全窗口AIS结论存在背离，"
-            "AIS结构已弱化，AI可依据此短窗口背离在 node_overrides 中提交覆盖。"
-        )
-
-    if bull_core:
+    if near["bull_core"]:
         answer = "是"
         branch = "AIL"
-        gate3_ok = swing_confirms_bull and (shallow is None or shallow)
-        strength = "（结构确认，强AIL）" if gate3_ok else "（结构弱/回撤深，弱AIL）"
+        strength = "（结构确认，强AIL）" if near["gate3_bull"] else "（结构弱/回撤深，弱AIL）"
+        if bg["bear_core"]:
+            conflict_note = (
+                f" ⚠️ 近端K{N_near}-K1已切换多头惯性（加权同侧{near['above_ratio']:.0%}），"
+                f"背景K{N_bg}-K1仍偏空（加权同侧{bg['below_ratio']:.0%}）——"
+                "按Brooks并列原则：近端AIL为交易主方向，背景AIS仅作上方阻力风险提示，不否决做多。"
+            )
         reason = (
-            f"近{N}根K线中{above}根收盘高于EMA20（占比{above_ratio:.1%}"
-            f"≥{ALWAYS_IN_SAME_SIDE_RATIO:.0%}）；{slope_desc}；"
-            f"{swing_desc}；{pullback_desc}。"
+            f"【近端主判K{N_near}-K1】加权收盘高于EMA占比{near['above_ratio']:.1%}"
+            f"≥{ALWAYS_IN_NEAR_SAME_SIDE_RATIO:.0%}；{near['slope_desc']}；"
+            f"{near['swing_desc']}；{near['pullback_desc']}。"
             f"判定为Always In Long（AIL）{strength}。"
+            f"【背景参考K{N_bg}-K1】加权多侧{bg['above_ratio']:.1%}/空侧{bg['below_ratio']:.1%}；"
+            f"{bg['slope_desc']}。"
+            f"{conflict_note}"
         )
-        if divergence_warning:
-            reason += f" {divergence_warning}"
-    elif bear_core:
+    elif near["bear_core"]:
         answer = "是"
         branch = "AIS"
-        gate3_ok = swing_confirms_bear and (shallow is None or shallow)
-        strength = "（结构确认，强AIS）" if gate3_ok else "（结构弱/回撤深，弱AIS）"
+        strength = "（结构确认，强AIS）" if near["gate3_bear"] else "（结构弱/回撤深，弱AIS）"
+        if bg["bull_core"]:
+            conflict_note = (
+                f" ⚠️ 近端K{N_near}-K1已切换空头惯性（加权同侧{near['below_ratio']:.0%}），"
+                f"背景K{N_bg}-K1仍偏多（加权同侧{bg['above_ratio']:.0%}）——"
+                "按Brooks并列原则：近端AIS为交易主方向，背景AIL仅作下方支撑风险提示，不否决做空。"
+            )
         reason = (
-            f"近{N}根K线中{below}根收盘低于EMA20（占比{below_ratio:.1%}"
-            f"≥{ALWAYS_IN_SAME_SIDE_RATIO:.0%}）；{slope_desc}；"
-            f"{swing_desc}；{pullback_desc}。"
+            f"【近端主判K{N_near}-K1】加权收盘低于EMA占比{near['below_ratio']:.1%}"
+            f"≥{ALWAYS_IN_NEAR_SAME_SIDE_RATIO:.0%}；{near['slope_desc']}；"
+            f"{near['swing_desc']}；{near['pullback_desc']}。"
             f"判定为Always In Short（AIS）{strength}。"
+            f"【背景参考K{N_bg}-K1】加权多侧{bg['above_ratio']:.1%}/空侧{bg['below_ratio']:.1%}；"
+            f"{bg['slope_desc']}。"
+            f"{conflict_note}"
         )
-        if divergence_warning:
-            reason += f" {divergence_warning}"
+    elif bg["bull_core"]:
+        answer = "是"
+        branch = "AIL"
+        strength = "（仅背景确认，近端未共振，弱AIL）"
+        reason = (
+            f"【近端K{N_near}-K1】未达AIL阈值（多侧{near['above_ratio']:.1%}，{near['slope_desc']}）。"
+            f"【背景K{N_bg}-K1】仍满足AIL（多侧{bg['above_ratio']:.1%}，{bg['slope_desc']}）"
+            f"→弱AIL，优先等待近端结构确认。"
+            f"{strength}"
+        )
+    elif bg["bear_core"]:
+        answer = "是"
+        branch = "AIS"
+        strength = "（仅背景确认，近端未共振，弱AIS）"
+        reason = (
+            f"【近端K{N_near}-K1】未达AIS阈值（空侧{near['below_ratio']:.1%}，{near['slope_desc']}）。"
+            f"【背景K{N_bg}-K1】仍满足AIS（空侧{bg['below_ratio']:.1%}，{bg['slope_desc']}）"
+            f"→弱AIS，优先等待近端结构确认。"
+            f"{strength}"
+        )
     else:
         answer = "否"
         branch = None
         reason = (
-            f"近{N}根K线：多头侧{above}根（{above_ratio:.1%}），空头侧{below}根"
-            f"（{below_ratio:.1%}）；{slope_desc}；{swing_desc}；{pullback_desc}。"
-            f"同侧占比未达{ALWAYS_IN_SAME_SIDE_RATIO:.0%}阈值或方向不符，"
-            "不处于Always In状态。"
+            f"【近端K{N_near}-K1】多侧{near['above_ratio']:.1%}/空侧{near['below_ratio']:.1%}；"
+            f"{near['slope_desc']}；{near['swing_desc']}。"
+            f"【背景K{N_bg}-K1】多侧{bg['above_ratio']:.1%}/空侧{bg['below_ratio']:.1%}；"
+            f"{bg['slope_desc']}。"
+            "近端与背景均未达Always In阈值。"
         )
 
     return NodeFill(
@@ -1425,6 +1458,48 @@ def _get_signal_seq(out: dict[str, Any], bars: Any) -> int:
         pass
 
     return 1  # default to K1
+
+
+def is_planned_limit_order(out: dict[str, Any]) -> bool:
+    """True when order is a pending limit plan without requiring a closed signal bar."""
+    decision = out.get("decision")
+    if not isinstance(decision, dict) or decision.get("order_type") != "限价单":
+        return False
+    bar_analysis = out.get("bar_analysis")
+    if not isinstance(bar_analysis, dict):
+        return False
+    entry_bar = bar_analysis.get("entry_bar")
+    signal_bar = bar_analysis.get("signal_bar")
+    if not isinstance(entry_bar, dict) or not isinstance(signal_bar, dict):
+        return False
+    strength = str(entry_bar.get("strength", "") or "").strip().lower()
+    freshness = str(entry_bar.get("freshness", "") or "").strip().lower()
+    pending = (
+        strength == "not_triggered"
+        or entry_bar.get("bar") is None
+        or freshness == "pending"
+    )
+    if not pending:
+        return False
+    quality = str(signal_bar.get("quality", "") or "").strip().lower()
+    pattern = str(signal_bar.get("pattern", "") or "").strip().lower()
+    if signal_bar.get("bar") is None and quality in ("invalid", "weak"):
+        return True
+    if quality == "weak" and pattern in (
+        "",
+        "none",
+        "tr_boundary",
+        "breakout_pullback",
+        "h1",
+        "h2",
+        "l1",
+        "l2",
+        "wedge",
+        "mtr",
+        "trendline",
+    ):
+        return True
+    return False
 
 
 
@@ -1808,7 +1883,37 @@ def route_order_method(
 
     candidate = _CYCLE_ORDER_METHOD.get(cycle, "不下单")
 
+    model_order_type = str(decision.get("order_type") or "").strip()
 
+    def _has_trade_prices() -> bool:
+        return all(
+            decision.get(k) is not None
+            for k in ("entry_price", "stop_loss_price", "take_profit_price")
+        )
+
+    # Preserve model's explicit limit/market choice when §10.3 already passed.
+    if (
+        model_order_type == "限价单"
+        and _trace_answer(decision_trace, "10.3") == "是"
+        and _has_trade_prices()
+    ):
+        candidate = "限价单"
+    elif (
+        model_order_type == "市价单"
+        and _trace_answer(decision_trace, "10.3") == "是"
+        and _has_trade_prices()
+    ):
+        candidate = "市价单"
+    elif (
+        model_order_type == "突破单"
+        and _trace_answer(decision_trace, "10.3") == "是"
+        and _has_trade_prices()
+        and decision.get("entry_basis_bar")
+        and decision.get("entry_basis_extreme")
+    ):
+        # broad_channel defaults to 限价单, but a pending breakdown/breakout
+        # at basis±tick is not a sell-limit-above-market plan — preserve 突破单.
+        candidate = "突破单"
 
     if candidate == "不下单":
 
@@ -1834,8 +1939,6 @@ def route_order_method(
 
         spike_stage = str((stage1_json or {}).get("spike_stage") or "").strip().lower()
 
-        model_order_type = str(decision.get("order_type") or "").strip()
-
         if spike_stage in ("ending", "pullback", "channel") and model_order_type == "突破单":
 
             has_basis = bool(
@@ -1852,7 +1955,9 @@ def route_order_method(
 
 
 
-    # Breakout order: check for valid entry_basis
+    # Breakout order: check for valid entry_basis; fall back to limit when unavailable.
+
+    breakout_fallback_to_limit = False
 
     if candidate == "突破单":
 
@@ -1864,7 +1969,9 @@ def route_order_method(
 
         if not has_basis:
 
-            # Fallback to limit order
+            # No breakout anchor → try limit at structural level (if §10.3 already passed).
+
+            breakout_fallback_to_limit = True
 
             candidate = "限价单"
 
@@ -1964,6 +2071,12 @@ def route_order_method(
                     f"cycle_position={cycle}（spike_stage={spike_stage_label}，尖峰已结束）"
                     f"→{candidate}（保留模型突破单选择；尖峰结束后等待信号棒突破确认是正确做法，"
                     "不应强制市价单立即追入）。" + reason
+                )
+            elif breakout_fallback_to_limit and candidate == "限价单":
+                reason = (
+                    f"cycle_position={cycle} 默认突破单，但无有效 entry_basis_bar/extreme；"
+                    f"§10.3 已通过 → 改用限价单在结构位挂单（回撤/反弹到位入场）。"
+                    + reason
                 )
             else:
                 reason = f"cycle_position={cycle}→{candidate}。" + reason
@@ -2685,6 +2798,14 @@ class DecisionNodeEngine:
                 elif answer_24 == "否":
                     bar_analysis["always_in"] = "neutral"
 
+        # Step 7: Brooks trend_context (background vs trading direction)
+        try:
+            from pa_agent.ai.trend_context import build_trend_context
+
+            out["trend_context"] = build_trend_context(frame, str(out.get("direction", "neutral")))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("build_trend_context failed: %s", exc)
+
 
 
     @staticmethod
@@ -2750,16 +2871,17 @@ class DecisionNodeEngine:
         # "否"  = no valid signal bar exists right now
         # "等待" = AI semantically means "no valid signal bar" (should be "否" but
         #          AI sometimes conflates "does it exist?" with "should I wait?").
-        # Both map to skip §9.1-9.5.
+        # Both map to skip §9.1-9.5 — unless this is a planned limit order.
         _dt = out.get("decision_trace") or []
         _node_90 = next(
             (x for x in _dt if isinstance(x, dict) and str(x.get("node_id", "")) == "9.0"),
             None,
         )
+        _planned_limit = is_planned_limit_order(out)
         _section9_has_signal = True
         if _node_90 is not None:
             _ans_90 = str(_node_90.get("answer", "") or "").strip()
-            if _ans_90 in ("否", "等待"):
+            if _ans_90 in ("否", "等待") and not _planned_limit:
                 _section9_has_signal = False
 
 
@@ -2818,6 +2940,25 @@ class DecisionNodeEngine:
                 _node["skipped"] = True
                 _node["answer"] = "不适用"
                 _node["reason"] = _skip_reason
+        elif _planned_limit:
+            _bar_analysis = out.get("bar_analysis")
+            _signal_bar = (
+                _bar_analysis.get("signal_bar")
+                if isinstance(_bar_analysis, dict)
+                else None
+            )
+            _no_signal_bar = (
+                not isinstance(_signal_bar, dict) or not _signal_bar.get("bar")
+            )
+            if _no_signal_bar:
+                _skip_reason = (
+                    "计划型限价单，尚无已收盘信号棒，"
+                    "§9.1-9.3不适用（§9.0 已接受计划型入场）。"
+                )
+                for _node in (node_91, node_92, node_93):
+                    _node["skipped"] = True
+                    _node["answer"] = "不适用"
+                    _node["reason"] = _skip_reason
 
 
 

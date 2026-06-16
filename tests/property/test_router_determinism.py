@@ -152,3 +152,21 @@ def test_router_pattern_overlays_load_bar_by_bar_modules() -> None:
     assert "文件20-AlwaysIn与20GB.txt" in result
     assert "文件21-铁丝网与无交易环境.txt" in result
     assert "文件22-信号失败后的磁力位.txt" in result
+
+
+def test_router_neutral_channel_loads_range_for_boundary_setups() -> None:
+    """Neutral wide/normal channel should get range files for boundary limit orders."""
+    result = route_strategy_files(
+        {
+            "cycle_position": "broad_channel",
+            "direction": "neutral",
+            "detected_patterns": [],
+        }
+    )
+    assert result == [
+        "震荡区间分析识别.txt",
+        "震荡区间交易策略.txt",
+        "文件13-窄通道与宽通道策略.txt",
+        "文件15-二次入场机会.txt",
+        "文件19-H1H2-L1L2计数.txt",
+    ]

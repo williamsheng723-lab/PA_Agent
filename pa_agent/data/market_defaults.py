@@ -98,10 +98,10 @@ def is_likely_crypto_symbol(symbol: str) -> bool:
 
 def normalize_gold_symbol_for_kind(kind: str, symbol: str) -> str:
     """Map crypto / MT5-style names to gold defaults for *kind*."""
-    from pa_agent.data.akshare_source import normalize_ashare_symbol
+    from pa_agent.data.ashare_common import normalize_ashare_symbol
 
     sym = (symbol or "").strip()
-    if kind == "akshare":
+    if kind in ("akshare", "eastmoney"):
         code = normalize_ashare_symbol(sym)
         if not code or not _looks_like_ashare_code(code):
             return A_SHARE_DEFAULT_SYMBOL

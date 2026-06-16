@@ -34,10 +34,11 @@ CYCLE_POSITION_ZH: dict[str, str] = {
     "unknown": "未知",
 }
 
-# Direction → Chinese prefix (only applied to trending_tr)
+# Direction → Chinese prefix for cycle labels
 _DIRECTION_PREFIX_ZH: dict[str, str] = {
     "bullish": "上涨",
     "bearish": "下跌",
+    "neutral": "震荡",
 }
 
 
@@ -61,18 +62,17 @@ def format_cycle_with_direction(
 ) -> str:
     """Return the Chinese display text for a cycle, with an optional direction prefix.
 
-    The prefix (上涨 / 下跌) is applied ONLY when cycle_position == "trending_tr":
-      - bullish  → "上涨趋势型交易区间"
-      - bearish  → "下跌趋势型交易区间"
-      - neutral / missing / any other value → "趋势型交易区间" (no prefix)
-
-    For every other cycle the result is identical to format_cycle_position(cycle_position).
+    The prefix (上涨 / 下跌 / 震荡) is applied to all known cycle enums except "unknown":
+      - bullish + broad_channel → "上涨宽通道"
+      - bearish + trending_tr   → "下跌趋势型交易区间"
+      - neutral + trading_range → "震荡交易区间"
+      - missing/other direction → no prefix
 
     Pure function — does not modify any argument.
     """
     base = format_cycle_position(cycle_position)
     cp = (cycle_position or "").strip().lower()
-    if cp != "trending_tr":
+    if not cp or cp == "unknown":
         return base
     d = (direction or "").strip().lower()
     prefix = _DIRECTION_PREFIX_ZH.get(d, "")

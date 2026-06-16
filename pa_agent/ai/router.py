@@ -97,6 +97,14 @@ def route_strategy_files(stage1_json: dict[str, Any]) -> list[str]:
     files: list[str] = []
     files.extend(_base_files_for_cycle(cp, direction, spike_stage=spike_stage))
 
+    # Brooks: near-term spike is trading core even when cycle_position is channel/range
+    tc = stage1_json.get("trend_context") or {}
+    recent_spike = tc.get("recent_spike") if isinstance(tc, dict) else None
+    if recent_spike == "bullish" and cp != "spike" and direction == "bullish":
+        files.extend(_BULLISH_SPIKE_FILES)
+    elif recent_spike == "bearish" and cp != "spike" and direction == "bearish":
+        files.extend(_BEARISH_SPIKE_FILES)
+
     if alternative_cp and alternative_cp != cp:
         files.extend(_base_files_for_cycle(str(alternative_cp), direction, spike_stage=None))
 
@@ -190,6 +198,12 @@ def _channel_files(direction: str) -> list[str]:
     elif direction == "bearish":
         files.extend(_BEARISH_CHANNEL_FILES)
     else:
-        logger.warning("Channel-like state with neutral direction — no directional strategy files loaded")
+        # Neutral in a channel: skip directional channel files, but preload
+        # range strategy for boundary planned-limit setups (§9.0 path).
+        logger.warning(
+            "Channel-like state with neutral direction — "
+            "no directional channel files; loading range strategy for boundary setups"
+        )
+        files.extend(_RANGE_FILES)
     files.append(_CHANNEL_WIDTH_FILE)
     return files

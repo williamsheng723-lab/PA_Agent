@@ -216,6 +216,34 @@ STAGE1_SCHEMA: dict = {
         "detected_patterns": {"type": "array", "items": {"type": "string"}},
         "key_signals": {"type": "array", "items": {"type": "string"}},
         "htf_context": {"type": "string"},
+        "trend_context": {
+            "type": "object",
+            "properties": {
+                "background_direction": {
+                    "type": "string",
+                    "enum": ["bullish", "bearish", "neutral"],
+                },
+                "trading_direction": {
+                    "type": "string",
+                    "enum": ["bullish", "bearish", "neutral"],
+                },
+                "primary_direction": {
+                    "type": "string",
+                    "enum": ["bullish", "bearish", "neutral"],
+                },
+                "conflict": {"type": "boolean"},
+                "relationship": {
+                    "type": "string",
+                    "enum": ["aligned", "conflict", "neutral_background", "mixed"],
+                },
+                "recent_spike": {
+                    "type": ["string", "null"],
+                    "enum": ["bullish", "bearish", None],
+                },
+                "with_trend_rule": {"type": "string"},
+            },
+            "additionalProperties": True,
+        },
         "entry_setup": {"type": "string"},
         "strategy_files_needed": {"type": "array", "items": {"type": "string"}},
         "risk_warning": {"type": "string"},
@@ -538,7 +566,14 @@ _NEXT_CYCLE_PREDICTION: dict = {
 
 STAGE2_SCHEMA: dict = {
     "type": "object",
-    "required": ["decision", "diagnosis_summary", "decision_trace", "terminal"],
+    "required": [
+        "decision",
+        "diagnosis_summary",
+        "decision_trace",
+        "terminal",
+        "next_bar_prediction",
+        "next_cycle_prediction",
+    ],
     "properties": {
         "decision": _DECISION_BASE,
         "diagnosis_summary": {

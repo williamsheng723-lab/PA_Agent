@@ -7,9 +7,11 @@ from typing import Any
 from pa_agent.util.trade_metrics import (
     compute_risk_reward,
     format_estimated_win_rate,
+    max_risk_reward_ratio,
     min_risk_reward_ratio,
     passes_trader_equation,
 )
+from pa_agent.ai.cycle_enums import format_cycle_position, format_cycle_with_direction
 
 from PyQt6.QtWidgets import (
     QFrame,
@@ -34,19 +36,6 @@ _REASON_EDIT_CSS = (
 _PREDICTION_UNPREDICTABLE_COLOR = "#8b949e"
 _PREDICTION_UNPREDICTABLE_LABEL = "不可预测"
 
-# Brooks cycle_position → 中文（市场周期 / 频谱位置）
-_CYCLE_POSITION_ZH: dict[str, str] = {
-    "spike": "尖峰 (Spike)",
-    "micro_channel": "微型通道",
-    "tight_channel": "窄通道",
-    "normal_channel": "正常通道",
-    "broad_channel": "宽通道",
-    "trending_tr": "趋势型交易区间",
-    "trading_range": "交易区间",
-    "extreme_tr": "极端交易区间",
-    "unknown": "未知",
-}
-
 # 以震荡为主的周期类型
 _RANGE_CYCLES = frozenset({"trading_range", "extreme_tr", "trending_tr"})
 
@@ -60,11 +49,6 @@ _PREDICTION_DOMINANT_COLOR: dict[str, str] = {
     "bearish": "#f85149",
     "neutral": "#e6b800",
 }
-
-
-def _format_cycle_position(raw: str) -> str:
-    key = (raw or "").strip().lower()
-    return _CYCLE_POSITION_ZH.get(key, raw or "—")
 
 
 def _format_market_phase(raw: str) -> str:
@@ -361,10 +345,10 @@ class DecisionPanel(QWidget):
         self._trend_label.setText(f"趋势：{trend}")
         self._apply_diag_chip_style(self._trend_label, color=trend_color)
 
-        cycle_zh = _format_cycle_position(cycle_position)
+        cycle_zh = format_cycle_with_direction(cycle_position, direction)
         cycle_text = f"周期：{cycle_zh}"
         if alt_cycle:
-            cycle_text += f"（备选 {_format_cycle_position(str(alt_cycle))}）"
+            cycle_text += f"（备选 {format_cycle_position(str(alt_cycle))}）"
         self._cycle_label.setText(cycle_text)
         self._apply_diag_chip_style(self._cycle_label, color="#c9d1d9")
 
@@ -465,11 +449,23 @@ class DecisionPanel(QWidget):
         diagnosis_summary: dict | None = None,
         stage1_diagnosis: dict | None = None,
         decision_stance: str | None = None,
+        confidence_threshold: int | None = None,
     ) -> None:
         self._apply_market_diagnosis(diagnosis_summary, stage1_diagnosis)
 
         order_type = decision.get("order_type", _NO_ORDER)
         reasoning = decision.get("reasoning", decision.get("brief_reasoning", ""))
+        # Confidence gate: suppress order display when confidence < threshold
+        if confidence_threshold is not None and confidence_threshold > 0 and order_type != _NO_ORDER:
+            raw_conf = decision.get("trade_confidence")
+            try:
+                conf_val = int(float(str(raw_conf).strip())) if raw_conf is not None and raw_conf != "" else -1
+            except (ValueError, TypeError):
+                conf_val = -1
+            if conf_val < confidence_threshold:
+                order_type = _NO_ORDER
+                prefix = "有入场机会，但置信度未通过"
+                reasoning = f"{prefix}\n\n{reasoning}" if reasoning else prefix
         diag_conf = decision.get("diagnosis_confidence", None)
         diag_conf_reasoning = decision.get("diagnosis_confidence_reasoning", None)
         trade_conf = decision.get("trade_confidence", None)
@@ -530,7 +526,11 @@ class DecisionPanel(QWidget):
                     and passes_trader_equation(win_pct, risk, reward)
                 )
                 min_rr = min_risk_reward_ratio(decision_stance)
-                metrics_ok = ratio >= min_rr and (eq_ok if win_pct is not None else True)
+                max_rr = max_risk_reward_ratio()
+                metrics_ok = (
+                    min_rr <= ratio <= max_rr
+                    and (eq_ok if win_pct is not None else True)
+                )
                 eq_note = ""
                 if win_pct is not None:
                     eq_note = " · 方程通过" if eq_ok else " · 方程不通过"

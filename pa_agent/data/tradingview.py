@@ -12,7 +12,6 @@ from pa_agent.data.base import (
     normalize_kline_bar,
 )
 from pa_agent.data.datetime_ts import datetime_to_ts_ms
-from pa_agent.data.bar_close_wait import is_bar_still_forming
 from pa_agent.data.market_defaults import (
     is_tv_exchange_auto,
     resolve_tv_fetch_pair,
@@ -389,6 +388,18 @@ class TradingViewSource(DataSource):
                 closed=True,
             )
             if i == 0:
+                # Determine whether the newest bar is still forming.
+                # We must NOT pass bar.closed=True into is_bar_still_forming because
+                # that function short-circuits on bar.closed and would always return
+                # False — defeating the purpose of the check entirely.
+                # Instead, use seconds_until_bar_closes which only looks at the
+                # timestamp, and is robust to constant broker-time offsets.
+                from pa_agent.data.bar_close_wait import seconds_until_bar_closes
+
+                secs_left = seconds_until_bar_closes(
+                    ts_ms, self._timeframe, now_ms=None
+                )
+                still_forming = secs_left is not None and secs_left > 0
                 bar = KlineBar(
                     seq=bar.seq,
                     ts_open=bar.ts_open,
@@ -397,9 +408,7 @@ class TradingViewSource(DataSource):
                     low=bar.low,
                     close=bar.close,
                     volume=bar.volume,
-                    closed=is_bar_still_forming(
-                        bar, self._timeframe, symbol=self._symbol
-                    ),
+                    closed=not still_forming,
                 )
             bars.append(normalize_kline_bar(bar))
             if len(bars) >= n:

@@ -492,8 +492,14 @@ def normalize_trace_item(
     _ensure_trace_string_fields(item)
     lenient = normalization_mode == "lenient"
     nid = str(item.get("node_id", "")).strip()
+    # Strip decorative prefixes like "§" that the model sometimes adds
+    nid = nid.lstrip("§")
+    if nid != str(item.get("node_id", "")).strip():
+        item["node_id"] = nid
+
     if nid == "14":
         item["node_id"] = "14.1"
+        nid = "14.1"
 
     nid = str(item.get("node_id", ""))
 
@@ -502,12 +508,11 @@ def normalize_trace_item(
         resolved = _resolve_trace_answer(nid, ans)
         if resolved is not None:
             new_ans, branch = resolved
-            # In strict mode, only apply node-specific deterministic aliases
-            # (e.g. "路径B" → "是" for node 3.5). Generic fuzzy synonyms
-            # (e.g. "部分" → "中性") are gated by lenient mode because they
-            # involve interpretive judgement.
+            # Safe enum synonyms (待定→等待、通过→是) and node-specific maps always apply.
+            # Fuzzy partial answers (部分→中性) only in lenient mode.
             node_specific = bool(_NODE_ANSWER_BY_ID.get(nid))
-            if lenient or node_specific:
+            generic_hit = ans in _GENERIC_ANSWER or ans.lower() in _GENERIC_ANSWER
+            if generic_hit or node_specific or lenient:
                 if new_ans != ans:
                     logger.debug(
                         "trace answer %r -> %r (node %s branch=%s)",
@@ -533,6 +538,32 @@ def normalize_trace_item(
     )
 
 
+def _strip_ai_gate_14(gate_trace: list[Any]) -> None:
+    """Remove AI-written 14.1 nodes from gate_trace (program injects its own at front).
+
+    The model sometimes outputs node 14.1 (禁止行为扫描) in gate_trace.
+    After program injects its authoritative 14.1 at the front, duplicates
+    cause node ordering errors. We keep the first 14.1 and drop the rest.
+    """
+    if not isinstance(gate_trace, list) or not gate_trace:
+        return
+    kept: list[Any] = []
+    seen_14 = False
+    removed = 0
+    for item in gate_trace:
+        if isinstance(item, dict) and str(item.get("node_id", "")) == "14.1":
+            if not seen_14:
+                seen_14 = True
+                kept.append(item)
+            else:
+                removed += 1
+        else:
+            kept.append(item)
+    if removed:
+        gate_trace[:] = kept
+        logger.debug("Stripped %s duplicate AI-written 14.1 from gate_trace", removed)
+
+
 def normalize_trace_list(
     trace: list[Any] | None,
     *,
@@ -555,7 +586,7 @@ def normalize_trace_list(
             return 999
         nid = str(item.get("node_id", ""))
         for prefix, rank in _CHAPTER_ORDER.items():
-            if nid.startswith(prefix):
+            if nid.startswith(prefix) or nid == prefix.rstrip("."):
                 return rank
         return 500  # unrecognised nodes go in the middle
 
@@ -716,6 +747,42 @@ def _sync_gate_23_answer_with_direction(obj: dict[str, Any]) -> None:
         return
 
 
+def _repair_gate_result(obj: dict[str, Any]) -> None:
+    """Fix gate_result when AI incorrectly sets wait/unknown despite passing gates.
+
+    Per prompt rules, gate_result=wait/unknown is only valid for:
+    - §1.2 answer≠是 (cannot identify cycle)
+    - §1.3 answer=否 (extreme chaos, extreme_tr)
+
+    If neither condition holds but gate_result is wait/unknown, force to proceed.
+    """
+    gate_result = str(obj.get("gate_result", "")).strip().lower()
+    if gate_result not in ("wait", "unknown"):
+        return
+    gate = obj.get("gate_trace")
+    if not isinstance(gate, list) or not gate:
+        return
+    # Check for valid blocking conditions
+    node_12_block = any(
+        isinstance(item, dict)
+        and str(item.get("node_id", "")) == "1.2"
+        and str(item.get("answer", "")).strip() != "是"
+        for item in gate
+    )
+    node_13_block = any(
+        isinstance(item, dict)
+        and str(item.get("node_id", "")) == "1.3"
+        and str(item.get("answer", "")).strip() == "否"
+        for item in gate
+    )
+    if not node_12_block and not node_13_block:
+        obj["gate_result"] = "proceed"
+        logger.debug(
+            "gate_result %r -> proceed (no valid blocking condition found)",
+            gate_result,
+        )
+
+
 def _repair_stage1_gate_trace(obj: dict[str, Any]) -> None:
     """Format-only repairs so strict trace semantics pass on good-faith AI output."""
     gate = obj.get("gate_trace")
@@ -731,6 +798,7 @@ def _repair_stage1_gate_trace(obj: dict[str, Any]) -> None:
             item["question"] = canonical_q[nid]
 
     _sync_gate_23_answer_with_direction(obj)
+    _repair_gate_result(obj)
 
     if str(obj.get("gate_result", "")).lower() == "proceed":
         last = gate[-1]
@@ -745,8 +813,11 @@ def normalize_stage1_traces(
     *,
     normalization_mode: NormalizationMode = "strict",
 ) -> None:
+    gate = obj.get("gate_trace")
+    if isinstance(gate, list):
+        _strip_ai_gate_14(gate)
     normalize_trace_list(
-        obj.get("gate_trace"),
+        gate,
         normalization_mode=normalization_mode,
     )
     _repair_stage1_gate_trace(obj)

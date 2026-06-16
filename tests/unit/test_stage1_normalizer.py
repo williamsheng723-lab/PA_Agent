@@ -168,6 +168,84 @@ def test_validator_accepts_normalized_user_payload() -> None:
     assert isinstance(result, Ok)
 
 
+def test_normalize_signal_bar_null_infers_from_summary() -> None:
+    """Regression: signal_bar=null fails schema; infer from bar_by_bar_summary role=signal."""
+    import json
+
+    from pa_agent.ai.json_validator import Ok
+
+    raw = {**VALID_STAGE1, "direction": "bearish"}
+    raw["bar_analysis"] = {
+        "always_in": "short",
+        "last_closed_bar": "K1",
+        "bar_type": "doji",
+        "signal_bar": None,
+        "entry_setup_type": "none",
+        "follow_through": "failed",
+    }
+    raw["bar_by_bar_summary"] = [
+        {
+            "bar": "K7",
+            "role": "signal",
+            "bar_type": "trend_bear",
+            "context_effect": "strengthens_bear",
+            "follow_through": "yes",
+            "trapped_side": "none",
+            "reason": "空头最强信号棒",
+        },
+        {
+            "bar": "K1",
+            "role": "trap",
+            "bar_type": "doji",
+            "context_effect": "strengthens_bear",
+            "follow_through": "pending",
+            "trapped_side": "bulls",
+            "reason": "高开长上影测试失败",
+        },
+    ]
+    out = normalize_stage1(raw)
+    sb = out["bar_analysis"]["signal_bar"]
+    assert isinstance(sb, dict)
+    assert sb["bar"] == "K7"
+    assert sb["quality"] == "strong"
+
+    result = schema_test_validator().validate("stage1", json.dumps(out, ensure_ascii=False))
+    assert isinstance(result, Ok)
+
+
+def test_normalize_bar_type_ine_truncation_passes_schema() -> None:
+    """Regression: models truncate inside→ine in bar_analysis.bar_type."""
+    import json
+
+    from pa_agent.ai.json_validator import Ok
+
+    raw = {**VALID_STAGE1}
+    raw["bar_analysis"] = {
+        "always_in": "long",
+        "last_closed_bar": "K1",
+        "bar_type": "ine",
+        "signal_bar": {"bar": "K1", "quality": "weak", "reason": "inside回调"},
+        "entry_setup_type": "none",
+        "follow_through": "pending",
+    }
+    raw["bar_by_bar_summary"] = [
+        {
+            "bar": "K1",
+            "role": "test",
+            "bar_type": "inside",
+            "context_effect": "weakens_bull",
+            "follow_through": "pending",
+            "trapped_side": "bulls",
+            "reason": "内包阴线",
+        },
+    ]
+    out = normalize_stage1(raw)
+    assert out["bar_analysis"]["bar_type"] == "inside"
+
+    result = schema_test_validator().validate("stage1", json.dumps(out, ensure_ascii=False))
+    assert isinstance(result, Ok)
+
+
 def test_pad_bar_by_bar_summary_when_model_only_sends_five_bars() -> None:
     n = 100
     frame = KlineFrame(

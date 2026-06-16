@@ -59,6 +59,7 @@ class ChartWidget(pg.PlotWidget):
         self._seq_labels: list[SeqLabelItem] = []
         self._ema_line: pg.PlotDataItem | None = None
         self._overlay = OverlayLines()
+        self._sr_items: list[pg.GraphicsItem] = []  # support/resistance level lines
         self._pending_decision: dict | None = None
         self._direction_items: list[pg.GraphicsItem] = []
         self._seq_label_font_pt: int = 7
@@ -178,6 +179,90 @@ class ChartWidget(pg.PlotWidget):
         self._overlay.clear_lines(self)
         self._clear_direction_marker()
         self._pending_decision = None
+
+    def set_support_resistance(self, levels: list) -> None:
+        """Draw horizontal support/resistance lines from StructureLevel objects.
+
+        Parameters
+        ----------
+        levels:
+            List of ``StructureLevel`` objects (from ``pa_agent.gui.support_resistance``).
+            Supports are drawn in green, resistances in red/amber.
+        """
+        plot = self.getPlotItem()
+        for item in self._sr_items:
+            plot.removeItem(item)
+        self._sr_items.clear()
+
+        for level in levels:
+            kind = getattr(level, "kind", "support")
+            price = getattr(level, "price", None)
+            low = getattr(level, "low", price)
+            high = getattr(level, "high", price)
+            label_text = getattr(level, "label", kind)
+            if price is None:
+                continue
+
+            if kind == "support":
+                color = (34, 197, 94, 180)    # green
+                text_color = (134, 239, 172)   # light green
+            else:
+                color = (245, 158, 11, 180)    # amber
+                text_color = (251, 191, 36)    # yellow
+
+            # Draw the midline
+            line = pg.InfiniteLine(
+                pos=price,
+                angle=0,
+                pen=pg.mkPen(color=color, width=1,
+                             style=pg.QtCore.Qt.PenStyle.DashLine),
+                movable=False,
+            )
+            plot.addItem(line)
+            self._sr_items.append(line)
+
+            # Draw a zone fill if it's a range (high != low)
+            is_zone = abs((high or price) - (low or price)) > 1e-9
+            if is_zone and low is not None and high is not None:
+                zone_color = (*color[:3], 28)  # very transparent fill
+                fill = pg.LinearRegionItem(
+                    values=(low, high),
+                    orientation="horizontal",
+                    movable=False,
+                    brush=pg.mkBrush(color=zone_color),
+                    pen=pg.mkPen(None),
+                )
+                plot.addItem(fill)
+                self._sr_items.append(fill)
+
+            # Label
+            label = pg.TextItem(
+                text=f"{label_text}: {price:.5g}",
+                color=text_color,
+                anchor=(0.0, 0.5),
+            )
+            plot.addItem(label)
+            self._sr_items.append(label)
+            label._sr_price = float(price)  # type: ignore[attr-defined]
+
+        # Position labels at left edge (use exact price, not rounded display text)
+        if self._sr_items:
+            try:
+                x_min = self.getViewBox().viewRange()[0][0]
+                for item in self._sr_items:
+                    if isinstance(item, pg.TextItem):
+                        p = getattr(item, "_sr_price", None)
+                        if p is not None:
+                            item.setPos(x_min, float(p))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def clear_support_resistance(self) -> None:
+        """Remove all support/resistance lines from the chart."""
+        plot = self.getPlotItem()
+        for item in self._sr_items:
+            plot.removeItem(item)
+        self._sr_items.clear()
 
     # ── Price-axis resize via viewportEvent ──────────────────────────────────
 

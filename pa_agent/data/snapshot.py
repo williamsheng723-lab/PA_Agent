@@ -85,12 +85,14 @@ def _newest_closed_slice(
     """
     if not bars_raw or n < 1:
         return None
-    if has_forming_bar_at_head(
+    forming = has_forming_bar_at_head(
         bars_raw,
         timeframe or None,
         symbol=symbol or None,
         now_ms=now_ms,
-    ):
+    )
+
+    if forming:
         if len(bars_raw) < n + 1:
             return None
         return list(bars_raw[1 : n + 1])

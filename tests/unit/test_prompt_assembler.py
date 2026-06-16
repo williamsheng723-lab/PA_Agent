@@ -195,6 +195,36 @@ def test_stage1_output_reminder_present(assembler: PromptAssembler):
     assert "gate_result" in user
 
 
+def test_stage1_original_mode_requires_full_gate_trace(assembler: PromptAssembler):
+    """Original mode must inject the hard-rule block requiring all gate_trace nodes."""
+    frame = _make_frame()
+    messages = assembler.build_stage1(frame, analysis_mode="original")
+    user = messages[1]["content"]
+
+    assert "原始分析过程闸门硬规则" in user
+    assert "0.1" in user
+    assert "0.2" in user
+    assert "1.1" in user
+    assert "2.3" in user
+    assert "2.4" in user
+    # prefill hint must NOT appear in original mode
+    assert "程序预填充节点判断依据" not in user
+
+
+def test_stage1_optimized_mode_keeps_program_prefill_hint(assembler: PromptAssembler):
+    """Optimized mode keeps the deterministic prefill path and no hard-rule block."""
+    frame = _make_frame()
+    messages = assembler.build_stage1(frame, analysis_mode="optimized")
+    user = messages[1]["content"]
+
+    # Hard-rule block must NOT appear in optimized mode
+    assert "原始分析过程闸门硬规则" not in user
+    # The prefill hint may or may not appear (depends on indicators being computable),
+    # but either way the block should not be forced.
+    # The standard reminder should still be present.
+    assert "gate_result" in user
+
+
 def test_stage2_output_contract_present(assembler: PromptAssembler):
     """Stage 2 user turn must contain the output contract with null rule."""
     frame = _make_frame()
@@ -270,8 +300,8 @@ def test_stage2_message_roles(assembler: PromptAssembler):
     assert messages[1]["role"] == "user"
 
 
-def test_stage2_continuation_omits_stage1_user_prompt(assembler: PromptAssembler):
-    """Stage 2 must not duplicate the huge Stage 1 user turn; K-line table lives in Stage 2 user."""
+def test_stage2_continuation_is_standalone_not_stage1_chat(assembler: PromptAssembler):
+    """Stage 2 must not prepend Stage 1 user turn (OpenClaw Agent chat-mode retries)."""
     frame = _make_frame()
     stage1_messages = assembler.build_stage1(frame)
     stage1_json = {"cycle_position": "spike", "direction": "bearish", "gate_result": "proceed"}
@@ -285,20 +315,17 @@ def test_stage2_continuation_omits_stage1_user_prompt(assembler: PromptAssembler
         experience_entries=[],
     )
 
-    # New 4-message structure: system, user(S1), assistant(S1), user(S2)
-    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
-    # System prompt includes full binary tree (same as Stage 1 now)
-    assert "二元决策.txt" in messages[0]["content"] or "## 3." in messages[0]["content"]
-    # Message [1] is Stage 1 user prompt (with K-line table)
-    assert "K线数据" in messages[1]["content"]
-    assert "序号 | 时间" in messages[1]["content"]  # K-line table present
-    # Message [2] is Stage 1 assistant reply
-    assert "cycle_position" in messages[2]["content"]
-    # Message [3] is Stage 2 user prompt (without K-line table)
-    assert "沿用上一轮阶段一用户消息中的同一份 K线数据" in messages[3]["content"]
-    assert "下跌通道分析识别" in messages[3]["content"]
-    assert "上涨通道分析识别" not in messages[3]["content"]
-    assert "【最后一步·必做】" in messages[3]["content"]
+    assert [m["role"] for m in messages] == ["system", "user"]
+    s2_user = messages[1]["content"]
+    assert "阶段二 API 任务模式" in s2_user
+    assert "阶段二任务" in s2_user
+    assert "你现在只执行阶段一" not in s2_user
+    assert "沿用上一轮阶段一用户消息" not in s2_user
+    assert "K线数据" in s2_user
+    assert "序号 | 时间" in s2_user
+    assert "下跌通道分析识别" in s2_user
+    assert "上涨通道分析识别" not in s2_user
+    assert "【最后一步·必做】" in s2_user
 
 
 def test_stage2_prompt_includes_balanced_stance_guidance(assembler: PromptAssembler):
@@ -359,11 +386,16 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
     # Message [1] is the previous full Stage 1 user prompt (with K-line table)
     assert messages[1]["content"] == prev_user
-    # Message [2] is the previous Stage 1 reply
-    assert messages[2]["content"] == prev_assistant
+    # Message [2] is normalized bare JSON from validated stage1_diagnosis
+    assert messages[2]["content"].startswith("{")
+    assert "cycle_position" in messages[2]["content"]
+    assert "JSON 校验通过" not in messages[2]["content"]
+    assert "```" not in messages[2]["content"]
     # Message [3] is the incremental task
     incremental_user = messages[3]["content"]
     assert "阶段一增量更新任务" in incremental_user
+    assert "增量输出格式" in incremental_user
+    assert "诊断更新摘要" in incremental_user
     assert "新增已收盘K线:2" in incremental_user
     assert "上一轮已完成分析" in incremental_user
     assert "normal_channel" in incremental_user
@@ -378,6 +410,58 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     # But new K-line data is present
     assert "新增 K线数据" in incremental_user
     assert "完整窗口计算" in incremental_user
+
+
+def test_incremental_stage1_normalizes_fenced_previous_response(
+    assembler: PromptAssembler,
+) -> None:
+    """Previous assistant with prose + ```json fence becomes bare diagnosis JSON."""
+    import json
+
+    from pa_agent.records.schema import AnalysisRecord, RecordMeta
+
+    frame = _make_frame(5)
+    full_s1_messages = assembler.build_stage1(frame)
+    diagnosis = {
+        "cycle_position": "trending_tr",
+        "direction": "bullish",
+        "gate_result": "proceed",
+    }
+    fenced = (
+        "JSON 校验通过。以下是修正后的完整阶段一诊断 JSON：\n\n"
+        f"```json\n{json.dumps(diagnosis, ensure_ascii=False)}\n```"
+    )
+    previous = AnalysisRecord(
+        meta=RecordMeta(
+            timestamp_local_iso="2026-01-01T00:00:00.000",
+            timestamp_local_ms=1,
+            symbol="XAUUSD",
+            timeframe="1h",
+            bar_count=5,
+            ai_provider={},
+        ),
+        kline_data=[],
+        htf_text="",
+        stage1_messages=full_s1_messages,
+        stage1_response={"content": fenced},
+        stage1_diagnosis=diagnosis,
+        stage2_messages=[],
+        stage2_response=None,
+        stage2_decision={"decision": {"order_type": "不下单"}},
+        strategy_files_used=[],
+        experience_loaded=[],
+        exception=None,
+        usage_total={},
+    )
+
+    messages = assembler.build_incremental_stage1(frame, previous, 1)
+    assistant = messages[2]["content"]
+    assert assistant.startswith("{")
+    assert "trending_tr" in assistant
+    assert "JSON 校验通过" not in assistant
+    assert "```" not in assistant
+    parsed = json.loads(assistant)
+    assert parsed["cycle_position"] == "trending_tr"
 
 
 def test_incremental_stage1_raises_without_previous_messages(
@@ -437,8 +521,8 @@ def test_incremental_stage1_raises_without_previous_response(
         kline_data=[],
         htf_text="",
         stage1_messages=full_s1,  # has user message
-        stage1_response={},  # empty dict → no 'content' key → must raise
-        stage1_diagnosis={"cycle_position": "normal_channel"},
+        stage1_response={},  # empty dict → no 'content' key
+        stage1_diagnosis={},  # no validated diagnosis either → must raise
         stage2_messages=[],
         stage2_response=None,
         stage2_decision={"decision": {"order_type": "不下单"}},
@@ -542,7 +626,7 @@ def test_previous_prediction_rendered_in_incremental_mode(assembler: PromptAssem
         previous_record=previous,
     )
 
-    user = messages[3]["content"]  # Stage 2 user prompt is now at index 3
+    user = messages[1]["content"]  # Stage 2 user prompt
     assert "上一轮下一根K线预测" in user
     assert "阳线" in user
     assert "60%" in user
@@ -604,5 +688,5 @@ def test_unpredictable_previous_prediction_renders_note(assembler: PromptAssembl
         previous_record=previous,
     )
 
-    user = messages[3]["content"]  # Stage 2 user prompt is now at index 3
+    user = messages[1]["content"]  # Stage 2 user prompt
     assert "不可预测" in user

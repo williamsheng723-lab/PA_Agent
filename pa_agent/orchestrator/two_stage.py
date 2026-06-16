@@ -14,14 +14,16 @@ Coordinates the full Stage 1 (diagnosis) → Stage 2 (decision) pipeline:
 Cancel checks are performed before each stage and after each API call.
 Network/timeout errors are caught and recorded on the partial record.
 
-Stage 2 validation failure ends the run immediately (``STAGE2_VALIDATION_AUTO_RETRY``
-is always False): no second ``stream_chat`` and no automatic fix-and-revalidate loop.
+On validation failure, ``validation_retry`` may append a feedback user turn and
+re-call the API (see ``ValidationSettings.retry_*``). Semantic / safety errors
+are not retried; immutable-field cheat detection rejects suspicious retries.
 """
 from __future__ import annotations
 
-# Explicit policy: never re-call Stage 2 API after validation failure.
+# Legacy flag kept for tests/docs; retry is governed by ValidationSettings.
 STAGE2_VALIDATION_AUTO_RETRY = False
 
+import copy
 import dataclasses
 import logging
 import sys
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
     from pa_agent.records.pending_writer import PendingWriter
 
 from pa_agent.ai.json_validator import Ok, ValidationError
+from pa_agent.orchestrator.validation_retry import validate_with_retry
 from pa_agent.data.base import KlineFrame
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
 from pa_agent.util.threading import CancelToken, OrchestratorEvent
@@ -103,6 +106,13 @@ def _json_truncation_hint(content: str, err: ValidationError) -> str | None:
 
 def _enrich_stage2_validation_message(err: ValidationError, reply: Any) -> str:
     """Add actionable context for empty content or truncated JSON."""
+    from pa_agent.ai.provider_errors import (
+        PROVIDER_QUOTA_USER_MESSAGE,
+        is_provider_quota_exhausted,
+    )
+
+    if err.category == "e" or is_provider_quota_exhausted(err.raw_text):
+        return err.message or PROVIDER_QUOTA_USER_MESSAGE
     from pa_agent.ai.validation_messages import format_validation_errors
 
     detail = format_validation_errors(
@@ -140,6 +150,13 @@ def _enrich_stage2_validation_message(err: ValidationError, reply: Any) -> str:
 
 def _enrich_stage1_validation_message(err: ValidationError, reply: Any) -> str:
     """Add actionable context for empty content or truncated JSON."""
+    from pa_agent.ai.provider_errors import (
+        PROVIDER_QUOTA_USER_MESSAGE,
+        is_provider_quota_exhausted,
+    )
+
+    if err.category == "e" or is_provider_quota_exhausted(err.raw_text):
+        return err.message or PROVIDER_QUOTA_USER_MESSAGE
     from pa_agent.ai.validation_messages import format_validation_errors
 
     detail = format_validation_errors(
@@ -273,6 +290,14 @@ def _accumulate_usage(current: dict, reply_usage: Any) -> dict:
     return result
 
 
+def _accumulate_usage_calls(current: dict, usage_calls: list[Any]) -> dict:
+    total = dict(current)
+    for usage in usage_calls:
+        if usage is not None:
+            total = _accumulate_usage(total, usage)
+    return total
+
+
 class TwoStageOrchestrator:
     """Orchestrates the two-stage AI analysis pipeline.
 
@@ -313,6 +338,13 @@ class TwoStageOrchestrator:
         self._pending_writer = pending_writer
         self._exp_reader = exp_reader
         self._settings = settings
+
+    def _validation_settings(self) -> Any:
+        if self._settings is not None and hasattr(self._settings, "validation"):
+            return self._settings.validation
+        from pa_agent.config.settings import ValidationSettings
+
+        return ValidationSettings()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -380,15 +412,24 @@ class TwoStageOrchestrator:
         # ── Step 3: Stage 1 started ───────────────────────────────────────────
         on_event(OrchestratorEvent.Stage1Started)
 
+        # Resolve analysis mode from settings (default: original)
+        analysis_mode = "original"
+        if self._settings is not None:
+            analysis_mode = str(
+                getattr(self._settings.general, "analysis_mode", "original") or "original"
+            )
+
         # ── Step 4: Build Stage 1 messages ───────────────────────────────────
         if previous_record is not None and incremental_new_bar_count is not None:
             messages_s1 = self._assembler.build_incremental_stage1(
                 frame,
                 previous_record,
                 incremental_new_bar_count,
+                analysis_mode=analysis_mode,
+                provider_settings=getattr(self._settings, "provider", None),
             )
         else:
-            messages_s1 = self._assembler.build_stage1(frame)
+            messages_s1 = self._assembler.build_stage1(frame, analysis_mode=analysis_mode)
 
         # ── Step 5: Call AI for Stage 1 ───────────────────────────────────────
         logger.debug("\n" + "="*80)
@@ -423,13 +464,14 @@ class TwoStageOrchestrator:
                 on_stage1_content(chunk)
 
         try:
-            reply_s1 = self._client.stream_chat(
+            reply_s1 = self._stream_chat_resilient(
                 messages_s1,
                 on_reasoning_token=_on_s1_reasoning,
                 on_content_token=_on_s1_content,
                 cancel_token=cancel_token,
                 thinking=_thinking,
                 reasoning_effort=_effort,
+                stage_label="Stage 1",
             )
         except Exception as exc:
             if self._is_network_error(exc):
@@ -486,13 +528,47 @@ class TwoStageOrchestrator:
         if previous_record is not None and int(incremental_new_bar_count or 0) > 0:
             prev_s1 = previous_record.stage1_diagnosis
 
-        result_s1 = self._validator.validate(
-            "stage1",
-            reply_s1.content,
-            kline_frame=frame,
-            incremental_new_bar_count=int(incremental_new_bar_count or 0),
-            incremental_previous_stage1=prev_s1,
+        s1_usage_calls: list[Any] = [getattr(reply_s1, "usage", None)]
+
+        def _call_s1_retry(msgs: list[dict]) -> Any:
+            nonlocal s1_streamed_reasoning, s1_streamed_content
+            on_event(OrchestratorEvent.Stage1Retry)
+            s1_streamed_reasoning = False
+            s1_streamed_content = False
+            r = self._client.stream_chat(
+                msgs,
+                on_reasoning_token=_on_s1_reasoning,
+                on_content_token=_on_s1_content,
+                cancel_token=cancel_token,
+                thinking=_thinking,
+                reasoning_effort=_effort,
+            )
+            if not s1_streamed_reasoning and r.reasoning_content:
+                _emit_buffered_stream(r.reasoning_content, on_stage1_reasoning)
+            if not s1_streamed_content and r.content:
+                _emit_buffered_stream(r.content, on_stage1_content)
+            s1_usage_calls.append(getattr(r, "usage", None))
+            return r
+
+        vr_s1 = validate_with_retry(
+            stage="stage1",
+            messages=messages_s1,
+            reply=reply_s1,
+            validator=self._validator,
+            validation_settings=self._validation_settings(),
+            validate_kwargs={
+                "kline_frame": frame,
+                "incremental_new_bar_count": int(incremental_new_bar_count or 0),
+                "incremental_previous_stage1": prev_s1,
+            },
+            call_api=_call_s1_retry,
+            provider_settings=getattr(self._settings, "provider", None),
         )
+        messages_s1 = vr_s1.messages
+        reply_s1 = vr_s1.reply
+        result_s1 = vr_s1.result
+        if vr_s1.attempts > 1:
+            logger.info("Stage 1 validation succeeded after %d attempt(s)", vr_s1.attempts)
 
         if isinstance(result_s1, ValidationError):
             err = result_s1
@@ -506,9 +582,9 @@ class TwoStageOrchestrator:
                 update={
                     "stage1_messages": messages_s1,
                     "stage1_response": reply_s1.raw,
-                    "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
+                    "usage_total": _accumulate_usage_calls(record.usage_total, s1_usage_calls),
                     "exception": {
-                        "type": "validation_error",
+                        "type": "provider_error" if err.category == "e" else "validation_error",
                         "stage": "stage1",
                         "category": err.category,
                         "message": err_message,
@@ -618,6 +694,9 @@ class TwoStageOrchestrator:
             return record
 
         # ── Step 14: Build Stage 2 messages ───────────────────────────────────
+        _enable_next_bar = bool(
+            getattr(getattr(self._settings, "general", None), "enable_next_bar_prediction", False)
+        )
         messages_s2 = self._assembler.build_stage2_continuation(
             frame=frame,
             stage1_messages=messages_s1,
@@ -627,6 +706,7 @@ class TwoStageOrchestrator:
             experience_entries=experience_entries,
             decision_stance=record.meta.decision_stance,
             previous_record=previous_record,
+            enable_next_bar_prediction=_enable_next_bar,
         )
 
         # ── Step 15: Call AI for Stage 2 ──────────────────────────────────────
@@ -661,13 +741,14 @@ class TwoStageOrchestrator:
                 on_stage2_content(chunk)
 
         try:
-            reply_s2 = self._client.stream_chat(
+            reply_s2 = self._stream_chat_resilient(
                 messages_s2,
                 on_reasoning_token=_on_s2_reasoning,
                 on_content_token=_on_s2_content,
                 cancel_token=cancel_token,
                 thinking=_thinking,
                 reasoning_effort=_effort,
+                stage_label="Stage 2",
             )
         except Exception as exc:
             if self._is_network_error(exc):
@@ -740,13 +821,48 @@ class TwoStageOrchestrator:
         )
         logger.debug("="*80 + "\n")
 
-        result_s2 = self._validator.validate(
-            "stage2",
-            reply_s2.content,
-            decision_stance=record.meta.decision_stance,
-            kline_frame=frame,
-            stage1_json=stage1_json,
+        s2_usage_calls: list[Any] = [getattr(reply_s2, "usage", None)]
+
+        def _call_s2_retry(msgs: list[dict]) -> Any:
+            nonlocal s2_streamed_reasoning, s2_streamed_content
+            on_event(OrchestratorEvent.Stage2Retry)
+            s2_streamed_reasoning = False
+            s2_streamed_content = False
+            r = self._client.stream_chat(
+                msgs,
+                on_reasoning_token=_on_s2_reasoning,
+                on_content_token=_on_s2_content,
+                cancel_token=cancel_token,
+                thinking=_thinking,
+                reasoning_effort=_effort,
+            )
+            if not s2_streamed_reasoning and r.reasoning_content:
+                _emit_buffered_stream(r.reasoning_content, on_stage2_reasoning)
+            if not s2_streamed_content and r.content:
+                _emit_buffered_stream(r.content, on_stage2_content)
+            s2_usage_calls.append(getattr(r, "usage", None))
+            return r
+
+        vr_s2 = validate_with_retry(
+            stage="stage2",
+            messages=messages_s2,
+            reply=reply_s2,
+            validator=self._validator,
+            validation_settings=self._validation_settings(),
+            validate_kwargs={
+                "kline_frame": frame,
+                "decision_stance": record.meta.decision_stance,
+                "stage1_json": stage1_json,
+                "skip_next_bar": not _enable_next_bar,
+            },
+            call_api=_call_s2_retry,
+            provider_settings=getattr(self._settings, "provider", None),
         )
+        messages_s2 = vr_s2.messages
+        reply_s2 = vr_s2.reply
+        result_s2 = vr_s2.result
+        if vr_s2.attempts > 1:
+            logger.info("Stage 2 validation succeeded after %d attempt(s)", vr_s2.attempts)
 
         if isinstance(result_s2, ValidationError):
             err = result_s2
@@ -768,12 +884,12 @@ class TwoStageOrchestrator:
                         e.model_dump() if hasattr(e, "model_dump") else dict(e)
                         for e in experience_entries
                     ],
-                    "usage_total": _accumulate_usage(
-                        _accumulate_usage(record.usage_total, reply_s1.usage),
-                        reply_s2.usage,
+                    "usage_total": _accumulate_usage_calls(
+                        _accumulate_usage_calls(record.usage_total, s1_usage_calls),
+                        s2_usage_calls,
                     ),
                     "exception": {
-                        "type": "validation_error",
+                        "type": "provider_error" if err.category == "e" else "validation_error",
                         "stage": "stage2",
                         "category": err.category,
                         "message": err_message,
@@ -791,6 +907,9 @@ class TwoStageOrchestrator:
         # Validation passed
         assert isinstance(result_s2, Ok)
         stage2_json: dict = result_s2.obj
+        if not _enable_next_bar and isinstance(stage2_json, dict):
+            stage2_json = copy.deepcopy(stage2_json)
+            stage2_json.pop("next_bar_prediction", None)
 
         # ── Step 19: Stage 2 done ─────────────────────────────────────────────
         on_event(OrchestratorEvent.Stage2Done)
@@ -798,7 +917,9 @@ class TwoStageOrchestrator:
         # ── Step 19.5: Log next_bar_prediction (R9.3, NFR2.1) ───────────────────
         _pred = stage2_json if isinstance(stage2_json, dict) else {}
         _nb_pred = _pred.get("next_bar_prediction")
-        if isinstance(_nb_pred, dict):
+        if not _enable_next_bar:
+            logger.info("next_bar_prediction omitted (feature disabled)")
+        elif isinstance(_nb_pred, dict):
             if _nb_pred.get("unpredictable"):
                 logger.info("next_bar_prediction direction=null probs=null/null/null unpredictable=true")
             else:
@@ -810,13 +931,13 @@ class TwoStageOrchestrator:
                     _probs.get("bearish"),
                     _probs.get("neutral"),
                 )
-        else:
+        elif _enable_next_bar:
             logger.info("next_bar_prediction absent from stage2 response")
 
         # ── Step 20: Build final record ───────────────────────────────────────
-        usage_total = _accumulate_usage(
-            _accumulate_usage(record.usage_total, reply_s1.usage),
-            reply_s2.usage,
+        usage_total = _accumulate_usage_calls(
+            _accumulate_usage_calls(record.usage_total, s1_usage_calls),
+            s2_usage_calls,
         )
         record = record.model_copy(
             update={
@@ -853,6 +974,129 @@ class TwoStageOrchestrator:
             return True, "max"
         p = self._settings.provider
         return p.thinking, p.reasoning_effort
+
+    def _stream_chat_resilient(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        on_reasoning_token: Callable[[str], None] | None,
+        on_content_token: Callable[[str], None] | None,
+        cancel_token: CancelToken,
+        thinking: bool,
+        reasoning_effort: str,
+        stage_label: str,
+    ) -> Any:
+        """Call stream_chat; on connection error, switch to QClaw and retry once."""
+        original_model = (
+            self._settings.provider.model if self._settings is not None else ""
+        )
+        tried_qclaw = False
+        tried_workbuddy = False
+        while True:
+            try:
+                return self._client.stream_chat(
+                    messages,
+                    on_reasoning_token=on_reasoning_token,
+                    on_content_token=on_content_token,
+                    cancel_token=cancel_token,
+                    thinking=thinking,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:
+                if not self._is_network_error(exc):
+                    raise
+                # Try WorkBuddy fallback first (if model is openclaw_wb),
+                # then QClaw fallback (if model is openclaw)
+                if not tried_workbuddy and self._try_workbuddy_fallback(
+                    original_model=original_model
+                ):
+                    tried_workbuddy = True
+                    logger.info(
+                        "%s network error (%s); applied WorkBuddy provider — retrying",
+                        stage_label,
+                        exc,
+                    )
+                elif not tried_qclaw and self._try_qclaw_fallback(
+                    original_model=original_model
+                ):
+                    tried_qclaw = True
+                    logger.info(
+                        "%s network error (%s); applied QClaw provider — retrying",
+                        stage_label,
+                        exc,
+                    )
+                else:
+                    raise
+
+    def _try_qclaw_fallback(self, *, original_model: str = "") -> bool:
+        """Apply local QClaw provider (like settings Save with model=openclaw)."""
+        from pa_agent.ai.qclaw_connector import (
+            apply_qclaw_provider_to_settings,
+            is_openclaw_model,
+        )
+        from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+        if not is_openclaw_model(original_model):
+            return False
+        if self._settings is None:
+            return False
+
+        from pa_agent.config.settings import save_settings
+        from pa_agent.util.logging import update_api_key
+
+        err = apply_qclaw_provider_to_settings(self._settings)
+        if err:
+            logger.warning("QClaw auto-fallback unavailable: %s", err)
+            return False
+
+        self._client.update_provider(self._settings.provider)
+        try:
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+            update_api_key(self._settings.provider.api_key)
+        except Exception as save_exc:  # noqa: BLE001
+            logger.warning("QClaw fallback applied but settings save failed: %s", save_exc)
+
+        logger.info(
+            "QClaw auto-fallback: model=%s base_url=%s",
+            self._settings.provider.model,
+            self._settings.provider.base_url,
+        )
+        return True
+
+    def _try_workbuddy_fallback(self, *, original_model: str = "") -> bool:
+        """Apply WorkBuddy provider (like settings Save with model=openclaw_wb)."""
+        from pa_agent.ai.workbuddy_connector import (
+            apply_workbuddy_provider_to_settings,
+            is_openclaw_wb_model,
+        )
+        from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+        if not is_openclaw_wb_model(original_model):
+            return False
+        if self._settings is None:
+            return False
+
+        from pa_agent.config.settings import save_settings
+        from pa_agent.util.logging import update_api_key
+
+        err = apply_workbuddy_provider_to_settings(self._settings)
+        if err:
+            logger.warning("WorkBuddy auto-fallback unavailable: %s", err)
+            return False
+
+        self._client.update_provider(self._settings.provider)
+        try:
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+            update_api_key(self._settings.provider.api_key)
+        except Exception as save_exc:  # noqa: BLE001
+            logger.warning("WorkBuddy fallback applied but settings save failed: %s", save_exc)
+
+        logger.info(
+            "WorkBuddy auto-fallback: model=%s base_url=%s",
+            self._settings.provider.model,
+            self._settings.provider.base_url,
+        )
+        return True
 
     @staticmethod
     def _is_network_error(exc: Exception) -> bool:

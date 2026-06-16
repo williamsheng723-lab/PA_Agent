@@ -90,36 +90,57 @@ def _valid_prediction() -> dict:
 
 
 def test_stage2_schema_backward_compatible_without_prediction():
-    """Legacy Stage 2 JSON without next_bar_prediction must validate OK."""
+    """Legacy Stage 2 JSON without predictions is auto-filled in normalizer."""
     obj = _valid_stage2_no_prediction()
     result = _validator.validate("stage2", json.dumps(obj, ensure_ascii=False))
     assert isinstance(result, Ok), f"Expected Ok, got {result}"
+    assert isinstance(result.obj.get("next_bar_prediction"), dict)
+    assert isinstance(result.obj.get("next_cycle_prediction"), dict)
+
+
+def _valid_cycle_prediction() -> dict:
+    return {
+        "cycle": "normal_channel",
+        "direction": "bullish",
+        "probabilities": {
+            "spike": 5,
+            "micro_channel": 5,
+            "tight_channel": 10,
+            "normal_channel": 40,
+            "broad_channel": 15,
+            "trending_tr": 10,
+            "trading_range": 10,
+            "extreme_tr": 5,
+        },
+        "reasoning": "通道延续概率最高。",
+        "unpredictable": False,
+        "features_used": ["stage1_diagnosis"],
+    }
 
 
 def test_stage2_schema_accepts_valid_prediction():
-    """Stage 2 JSON with valid next_bar_prediction must validate OK."""
+    """Stage 2 JSON with valid predictions must validate OK."""
     obj = _valid_stage2_no_prediction()
     obj["next_bar_prediction"] = _valid_prediction()
+    obj["next_cycle_prediction"] = _valid_cycle_prediction()
     result = _validator.validate("stage2", json.dumps(obj, ensure_ascii=False))
     assert isinstance(result, Ok), f"Expected Ok, got {result}"
 
 
-def test_stage2_schema_rejects_invalid_prediction_subfield():
-    """Invalid sub-field in next_bar_prediction must cause c-category error."""
+def test_stage2_normalizer_aligns_prediction_direction_to_argmax():
+    """Normalizer fixes direction when it disagrees with probability argmax."""
     obj = _valid_stage2_no_prediction()
+    obj["next_cycle_prediction"] = _valid_cycle_prediction()
     obj["next_bar_prediction"] = {
-        "direction": "bullish",
-        "probabilities": {"bullish": 10, "bearish": 10, "neutral": 10},  # sum=30
+        "direction": "bearish",
+        "probabilities": {"bullish": 50, "bearish": 30, "neutral": 20},
         "reasoning": "x" * 30,
         "unpredictable": False,
         "features_used": ["stage1_diagnosis"],
     }
     result = _validator.validate("stage2", json.dumps(obj, ensure_ascii=False))
-    assert isinstance(result, ValidationError)
-    assert result.category == "c"
-    assert any("next_bar_prediction." in f for f in result.invalid_fields), (
-        f"Expected next_bar_prediction. prefix, got {result.invalid_fields}"
-    )
+    assert isinstance(result, Ok), f"Expected Ok, got {result}"
+    assert result.obj["next_bar_prediction"]["direction"] == "bullish"
 
 
 # ── T6: Validator unit tests for _check_next_bar_prediction ──────────────────

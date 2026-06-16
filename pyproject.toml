@@ -29,6 +29,7 @@ dependencies = [
 ashare = [
     "akshare>=1.14",
     "baostock>=0.8",
+    "curl_cffi>=0.13",
 ]
 dev = [
     "pytest>=8",

@@ -569,3 +569,116 @@ class TestApplyStage1:
         else:
             assert n23["answer"] == "中性"
             assert n23.get("branch") == "neutral"
+
+
+def test_is_planned_limit_order_detects_pending_limit_without_signal_bar() -> None:
+    from pa_agent.ai.decision_nodes import is_planned_limit_order
+
+    obj = {
+        "decision": {"order_type": "限价单"},
+        "bar_analysis": {
+            "signal_bar": {"bar": None, "quality": "invalid", "pattern": "none"},
+            "entry_bar": {
+                "bar": None,
+                "strength": "not_triggered",
+                "freshness": "pending",
+            },
+        },
+    }
+    assert is_planned_limit_order(obj) is True
+
+
+def test_is_planned_limit_order_detects_weak_boundary_limit() -> None:
+    from pa_agent.ai.decision_nodes import is_planned_limit_order
+
+    obj = {
+        "decision": {"order_type": "限价单"},
+        "bar_analysis": {
+            "signal_bar": {"bar": "K2", "quality": "weak", "pattern": "tr_boundary"},
+            "entry_bar": {
+                "bar": None,
+                "strength": "not_triggered",
+                "freshness": "pending",
+            },
+        },
+    }
+    assert is_planned_limit_order(obj) is True
+
+
+def test_normalize_stage2_upgrades_9_0_for_planned_limit() -> None:
+    from pa_agent.ai.stage2_normalizer import normalize_stage2
+
+    obj = {
+        "decision": {
+            "order_type": "限价单",
+            "order_direction": "做空",
+            "entry_price": 101.0,
+            "take_profit_price": 98.0,
+            "stop_loss_price": 103.0,
+            "reasoning": "test",
+            "diagnosis_confidence": 60,
+            "diagnosis_confidence_reasoning": "test",
+            "trade_confidence": 50,
+            "trade_confidence_reasoning": "test",
+            "estimated_win_rate": 52,
+            "estimated_win_rate_reasoning": "test",
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "test",
+            "invalidation_condition": "test",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "broad_channel",
+            "direction": "neutral",
+            "key_signals": [],
+        },
+        "bar_analysis": {
+            "always_in": "neutral",
+            "last_closed_bar": "K1",
+            "bar_type": "doji",
+            "signal_bar": {
+                "bar": None,
+                "quality": "invalid",
+                "pattern": "none",
+                "reason": "计划型限价",
+            },
+            "entry_bar": {
+                "bar": None,
+                "strength": "not_triggered",
+                "follow_through": "pending",
+                "still_valid": True,
+                "freshness": "pending",
+            },
+            "second_entry": {"is_second_entry": False, "type": "none"},
+        },
+        "decision_trace": [
+            {
+                "node_id": "9.0",
+                "question": "信号棒是否已经收盘且质量足够？",
+                "answer": "否",
+                "reason": "K1 doji",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.3",
+                "question": "交易者方程是否通过？",
+                "answer": "是",
+                "reason": "test",
+                "bar_range": "K1",
+            },
+        ],
+        "terminal": {"node_id": "11.4", "outcome": "trade", "label": "test"},
+    }
+    frame = KlineFrame(
+        symbol="XAUUSD",
+        timeframe="5m",
+        bars=(
+            _make_bar(1, close=100.0, high=100.5, low=99.0),
+            _make_bar(2, close=101.0, high=102.0, low=98.0),
+        ),
+        indicators=IndicatorBundle(ema20=(100.0, 100.0), atr14=(2.0, 2.0)),
+        snapshot_ts_local_ms=1,
+    )
+    out = normalize_stage2(obj, kline_frame=frame, stage1_json=obj["diagnosis_summary"])
+    node_90 = next(n for n in out["decision_trace"] if n["node_id"] == "9.0")
+    assert node_90["answer"] == "是"
